@@ -11,6 +11,16 @@ pub fn db_path() -> PathBuf {
     data_dir.join("gifs.db")
 }
 
+pub fn gifs_storage_dir() -> PathBuf {
+    let proj_dirs = directories::ProjectDirs::from("com", "yourcompany", "gifvault")
+        .expect("could not determine app data directory");
+
+    let storage_dir = proj_dirs.data_dir().join("gifs");
+    std::fs::create_dir_all(&storage_dir).expect("could not create gifs storage directory");
+
+    storage_dir
+}
+
 pub fn init_db() -> Connection {
     let path = db_path();
     let conn = Connection::open(&path).expect("could not open database");

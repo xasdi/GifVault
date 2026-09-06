@@ -1,10 +1,16 @@
 use crate::model::Gif;
 use rusqlite::{Connection, Result};
 
-pub fn insert_gif(conn: &Connection, source_type: &str, source_path: &str) -> Result<i64> {
+pub fn insert_gif(
+    conn: &Connection,
+    source_type: &str,
+    source_path: &str,
+    local_cache_path: &str,
+) -> Result<i64> {
     conn.execute(
-        "INSERT INTO gifs (source_type, source_path, added_at) VALUES (?1, ?2, datetime('now'))",
-        (source_type, source_path),
+        "INSERT INTO gifs (source_type, source_path, local_cache_path, added_at)
+         VALUES (?1, ?2, ?3, datetime('now'))",
+        (source_type, source_path, local_cache_path),
     )?;
 
     Ok(conn.last_insert_rowid())
