@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+iced = { version = "0.14", features = ["wgpu", "tiny-skia", "image", "svg"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+directories = "5"
+rfd = "0.15"
+image = "0.25"
