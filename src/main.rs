@@ -755,9 +755,24 @@ impl App {
     // please sanity-check that pasting actually works before relying on it.
     #[cfg(target_os = "windows")]
     fn copy_file_to_clipboard(path: &str) -> bool {
-        use clipboard_win::{formats, set_clipboard};
+        // `set_clipboard` (the convenience free function) can't be used
+        // here: `FileList` only implements `Setter<[T]>` (an unsized
+        // slice), but `set_clipboard`'s `data` parameter is taken by value
+        // and requires `Sized`. Opening the clipboard and calling the
+        // trait method directly (which takes `&[T]`) sidesteps that.
+        use clipboard_win::{formats::FileList, Clipboard, Setter};
 
-        match set_clipboard(formats::FileList, [path]) {
+        // Kept alive (as `_clipboard`) for the duration of the write; the
+        // clipboard closes automatically when it drops at the end of scope.
+        let _clipboard = match Clipboard::new_attempts(10) {
+            Ok(clipboard) => clipboard,
+            Err(err) => {
+                eprintln!("Failed to open clipboard: {err}");
+                return false;
+            }
+        };
+
+        match FileList.write_clipboard(&[path]) {
             Ok(()) => true,
             Err(err) => {
                 eprintln!("Failed to copy file to clipboard: {err}");
