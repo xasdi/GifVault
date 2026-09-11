@@ -1,3 +1,8 @@
+// Without this, Windows launches a console window alongside the GUI one
+// (the default "console" subsystem), and closing it kills the app. A no-op
+// on every other platform, so it's safe to leave unconditional.
+#![windows_subsystem = "windows"]
+
 mod db;
 mod model;
 mod thumbnail;

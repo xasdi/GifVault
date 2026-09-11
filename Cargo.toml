@@ -1,6 +1,6 @@
 [package]
 name = "GifVault"
-version = "1.0.0"
+version = "1.0.2"
 edition = "2024"
 
 # Used by `cargo bundle` to produce a double-clickable macOS .app in CI.

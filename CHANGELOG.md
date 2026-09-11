@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.2
+
+- Fix: on Windows, launching `GifVault.exe` opened an extra console window
+  alongside the app, and closing that console killed the app with it. The
+  binary now builds with the `windows` subsystem instead of the default
+  `console` one, so only the actual GUI window appears.
+
 ## v1.0.1
 
 - Fix: the Windows build failed to compile (`clipboard-win`'s `set_clipboard`
