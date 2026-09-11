@@ -5,18 +5,99 @@ mod thumbnail;
 use iced::widget::image::Handle;
 use iced::widget::{
     button, center, column, container, image, mouse_area, opaque, row, scrollable, stack, text,
-    text_input,
+    text_input, tooltip,
 };
+use iced::keyboard;
 use iced::window::Settings as WindowSettings;
-use iced::{Color, Element, Length, Size, Task};
+use iced::{Bottom, Center, Color, ContentFit, Element, Length, Size, Subscription, Task, Theme};
 use model::Gif;
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use thumbnail::GifAnimation;
+
+const TAG_DRAFT_INPUT_ID: &str = "tag-draft-input";
+
+const GRID_COLUMNS: usize = 3;
+const TILE_WIDTH: f32 = 280.0;
+const TILE_SPACING: f32 = 15.0;
+const MIN_TILE_HEIGHT: f32 = 140.0;
+const MAX_TILE_HEIGHT: f32 = 420.0;
+// Tiles within this many pixels of the viewport are also kept animated, so
+// playback doesn't visibly pause right as a tile scrolls into view.
+const VISIBILITY_MARGIN: f32 = 400.0;
+const POPULAR_TAGS_LIMIT: usize = 8;
+const TOAST_DURATION_MS: u64 = 2200;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ImportMode {
     Copy,
     Move,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ViewMode {
+    Library,
+    Trash,
+    Stats,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SortMode {
+    DateNewest,
+    DateOldest,
+    MostUsed,
+    LeastUsed,
+}
+
+impl SortMode {
+    const ALL: [SortMode; 4] = [
+        SortMode::DateNewest,
+        SortMode::DateOldest,
+        SortMode::MostUsed,
+        SortMode::LeastUsed,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::DateNewest => "Newest",
+            SortMode::DateOldest => "Oldest",
+            SortMode::MostUsed => "Most used",
+            SortMode::LeastUsed => "Least used",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AppTheme {
+    Light,
+    Dark,
+}
+
+impl AppTheme {
+    fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("light") => AppTheme::Light,
+            _ => AppTheme::Dark,
+        }
+    }
+
+    fn as_setting(self) -> &'static str {
+        match self {
+            AppTheme::Light => "light",
+            AppTheme::Dark => "dark",
+        }
+    }
+
+    fn to_iced_theme(self) -> Theme {
+        match self {
+            AppTheme::Light => Theme::Light,
+            AppTheme::Dark => Theme::Dark,
+        }
+    }
 }
 
 /// Represents a gif that has been successfully staged (either picked from
@@ -30,23 +111,51 @@ struct StagedGif {
 
 struct GifEntry {
     gif: Gif,
-    thumbnail: Option<Handle>,
+    animation: Option<GifAnimation>,
     tags: Vec<String>,
+    current_frame: usize,
+    frame_elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LibraryStats {
+    gif_count: usize,
+    total_size_bytes: u64,
+    local_count: usize,
+    url_count: usize,
+    total_copies: i64,
+    trash_count: usize,
+    trash_size_bytes: u64,
 }
 
 struct App {
     conn: Connection,
     entries: Vec<GifEntry>,
+    deleted_entries: Vec<GifEntry>,
+    view_mode: ViewMode,
+    sort_mode: SortMode,
+    app_theme: AppTheme,
     filter_input: String,
     show_import_modal: bool,
     pending_file: Option<PathBuf>,
     staged_gif: Option<StagedGif>,
     pending_thumbnail: Option<Handle>,
-    modal_tags_input: String,
+    staged_tags: Vec<String>,
+    tag_draft: String,
+    tag_suggestion: Option<String>,
+    tag_stats: Vec<(String, i64)>,
     import_mode: ImportMode,
     url_input: String,
     is_fetching_url: bool,
     import_error: Option<String>,
+    detail_gif_id: Option<i64>,
+    scroll_offset: f32,
+    viewport_height: f32,
+    visible_gif_ids: HashSet<i64>,
+    last_tick: Option<Instant>,
+    toast: Option<(String, Instant)>,
+    pending_import_zip: Option<PathBuf>,
+    stats: LibraryStats,
 }
 
 #[derive(Debug, Clone)]
@@ -59,47 +168,223 @@ enum Message {
     UrlInputChanged(String),
     FetchUrl,
     UrlFetched(Result<PathBuf, String>),
-    ModalTagsChanged(String),
+    TagDraftChanged(String),
+    CommitTagDraft,
+    RemoveStagedTag(usize),
+    TagInputKey(keyboard::Event),
+    PopularTagClicked(String),
     ImportModeChanged(ImportMode),
     ConfirmImport,
+    MoveToTrash(i64),
+    RestoreGif(i64),
+    PermanentlyDeleteGif(i64),
+    EmptyTrash,
+    CopyGifFile(i64),
+    ShowDetail(i64),
+    HideDetail,
+    Scrolled(scrollable::Viewport),
+    Tick(Instant),
+    SetViewMode(ViewMode),
+    SortModeChanged(SortMode),
+    ThemeChanged(AppTheme),
+    ExportBackup,
+    ExportDestinationChosen(Option<PathBuf>),
+    ImportBackupClicked,
+    ImportZipChosen(Option<PathBuf>),
+    ConfirmImportBackup,
+    CancelImportBackup,
+}
+
+/// Where a tile lands in the masonry grid: which column, how far down it
+/// sits within that column, and how tall it is.
+struct TilePlacement {
+    column: usize,
+    y_offset: f32,
+    height: f32,
+}
+
+/// Greedily places each tile (in order) into the shortest column so far,
+/// producing a Pinterest-style masonry layout.
+fn compute_layout(heights: &[f32]) -> Vec<TilePlacement> {
+    let mut column_heights = [0.0f32; GRID_COLUMNS];
+
+    heights
+        .iter()
+        .map(|&height| {
+            let column = column_heights
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(index, _)| index)
+                .unwrap();
+
+            let y_offset = column_heights[column];
+            column_heights[column] += height + TILE_SPACING;
+
+            TilePlacement {
+                column,
+                y_offset,
+                height,
+            }
+        })
+        .collect()
 }
 
 impl App {
     fn new() -> Self {
         let conn = db::init_db();
         let entries = Self::load_entries(&conn);
+        let deleted_entries =
+            Self::build_entries(&conn, db::queries::list_deleted_gifs(&conn).unwrap_or_default());
+        let app_theme =
+            AppTheme::from_setting(db::queries::get_setting(&conn, "theme").ok().flatten().as_deref());
 
-        Self {
+        let mut app = Self {
             conn,
             entries,
+            deleted_entries,
+            view_mode: ViewMode::Library,
+            sort_mode: SortMode::DateNewest,
+            app_theme,
             filter_input: String::new(),
             show_import_modal: false,
             pending_file: None,
             staged_gif: None,
             pending_thumbnail: None,
-            modal_tags_input: String::new(),
+            staged_tags: Vec::new(),
+            tag_draft: String::new(),
+            tag_suggestion: None,
+            tag_stats: Vec::new(),
             import_mode: ImportMode::Copy,
             url_input: String::new(),
             is_fetching_url: false,
             import_error: None,
+            detail_gif_id: None,
+            scroll_offset: 0.0,
+            // No scroll event has fired yet, so assume a generous viewport
+            // to avoid punishing tiles that are visible on first render.
+            viewport_height: 900.0,
+            visible_gif_ids: HashSet::new(),
+            last_tick: None,
+            toast: None,
+            pending_import_zip: None,
+            stats: LibraryStats::default(),
+        };
+        Self::backfill_dimensions_for(&app.conn, &mut app.entries);
+        Self::backfill_dimensions_for(&app.conn, &mut app.deleted_entries);
+        app.recompute_visible();
+        app.refresh_tag_stats();
+        app
+    }
+
+    /// Builds entries without decoding any gif frames — dimensions (needed
+    /// for grid layout) already live in the database, so a tile can be laid
+    /// out and shown as a static preview (via `Handle::from_path`) long
+    /// before it's ever actually decoded. Real per-frame decoding only
+    /// happens once a tile is scrolled into view — see `ensure_decoded`.
+    fn build_entries(conn: &Connection, gifs: Vec<Gif>) -> Vec<GifEntry> {
+        gifs.into_iter()
+            .map(|gif| {
+                let tags = db::queries::list_tags_for_gif(conn, gif.id).unwrap_or_default();
+                GifEntry {
+                    gif,
+                    animation: None,
+                    tags,
+                    current_frame: 0,
+                    frame_elapsed_ms: 0,
+                }
+            })
+            .collect()
+    }
+
+    /// One-time fixup for gifs imported before dimensions were tracked in
+    /// the database (width/height default to 0 on migration). Peeking a
+    /// header is cheap, so this is fine to do for the whole library at
+    /// startup — it does not decode any frames.
+    fn backfill_dimensions_for(conn: &Connection, entries: &mut [GifEntry]) {
+        for entry in entries.iter_mut() {
+            if entry.gif.width > 0 && entry.gif.height > 0 {
+                continue;
+            }
+
+            let path =
+                entry.gif.local_cache_path.clone().unwrap_or_else(|| entry.gif.source_path.clone());
+
+            if let Some((width, height)) = thumbnail::peek_dimensions(&path) {
+                let _ = db::queries::set_gif_dimensions(conn, entry.gif.id, width, height);
+                entry.gif.width = width as i64;
+                entry.gif.height = height as i64;
+            }
+        }
+    }
+
+    /// Decodes (in parallel, across as many gifs as needed) whichever of the
+    /// given gif ids don't already have their frames decoded. Called right
+    /// after a batch of tiles becomes visible, so the library never pays for
+    /// decoding gifs that are never actually scrolled to.
+    fn ensure_decoded(&mut self, ids: &[i64]) {
+        let cache_dir = db::cache_dir();
+
+        let to_decode: Vec<(usize, i64, String)> = ids
+            .iter()
+            .filter_map(|&id| {
+                let index = self.entries.iter().position(|entry| entry.gif.id == id)?;
+                if self.entries[index].animation.is_some() {
+                    return None;
+                }
+                let path = self.entries[index]
+                    .gif
+                    .local_cache_path
+                    .clone()
+                    .unwrap_or_else(|| self.entries[index].gif.source_path.clone());
+                Some((index, id, path))
+            })
+            .collect();
+
+        if to_decode.is_empty() {
+            return;
+        }
+
+        let decoded: Vec<(usize, Option<GifAnimation>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = to_decode
+                .iter()
+                .map(|(index, id, path)| {
+                    let cache_dir = &cache_dir;
+                    scope.spawn(move || {
+                        (*index, thumbnail::load_animation_cached(*id, path, cache_dir))
+                    })
+                })
+                .collect();
+
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+        });
+
+        for (index, animation) in decoded {
+            if animation.is_some() {
+                self.entries[index].animation = animation;
+            }
         }
     }
 
     fn load_entries(conn: &Connection) -> Vec<GifEntry> {
-        let gifs = db::queries::list_gifs(conn).unwrap_or_default();
+        Self::build_entries(conn, db::queries::list_gifs(conn).unwrap_or_default())
+    }
 
-        gifs.into_iter()
-            .map(|gif| {
-                let path_to_load = gif.local_cache_path.as_deref().unwrap_or(&gif.source_path);
-                let thumbnail = thumbnail::load_thumbnail(path_to_load);
-                let tags = db::queries::list_tags_for_gif(conn, gif.id).unwrap_or_default();
-                GifEntry {
-                    gif,
-                    thumbnail,
-                    tags,
-                }
-            })
-            .collect()
+    fn load_deleted_entries(&mut self) {
+        let gifs = db::queries::list_deleted_gifs(&self.conn).unwrap_or_default();
+        self.deleted_entries = Self::build_entries(&self.conn, gifs);
+    }
+
+    /// Decodes and inserts just the newly-inserted gif, instead of
+    /// reloading (and re-decoding every frame of) the whole library.
+    fn push_new_entry(&mut self, gif_id: i64) {
+        let Ok(gif) = db::queries::get_gif(&self.conn, gif_id) else {
+            return;
+        };
+
+        if let Some(entry) = Self::build_entries(&self.conn, vec![gif]).into_iter().next() {
+            self.entries.insert(0, entry);
+        }
     }
 
     fn reset_modal_state(&mut self) {
@@ -107,29 +392,212 @@ impl App {
         self.pending_file = None;
         self.staged_gif = None;
         self.pending_thumbnail = None;
-        self.modal_tags_input.clear();
+        self.staged_tags.clear();
+        self.tag_draft.clear();
+        self.tag_suggestion = None;
         self.import_mode = ImportMode::Copy;
         self.url_input.clear();
         self.is_fetching_url = false;
         self.import_error = None;
     }
 
-    fn filtered_entries(&self) -> Vec<&GifEntry> {
+    fn filtered_indices(&self) -> Vec<usize> {
         let filter = self.filter_input.trim().to_lowercase();
 
-        if filter.is_empty() {
-            return self.entries.iter().collect();
+        let mut indices: Vec<usize> = if filter.is_empty() {
+            (0..self.entries.len()).collect()
+        } else {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_lowercase().contains(&filter))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+
+        indices.sort_by(|&a, &b| {
+            let a = &self.entries[a].gif;
+            let b = &self.entries[b].gif;
+
+            match self.sort_mode {
+                SortMode::DateNewest => b.added_at.cmp(&a.added_at),
+                SortMode::DateOldest => a.added_at.cmp(&b.added_at),
+                SortMode::MostUsed => b.use_count.cmp(&a.use_count),
+                SortMode::LeastUsed => a.use_count.cmp(&b.use_count),
+            }
+        });
+
+        indices
+    }
+
+    /// Dimensions come from the database (peeked at import time), not from
+    /// decoding — so layout never has to wait on, or trigger, a decode.
+    fn tile_height_for(entry: &GifEntry) -> f32 {
+        let width = entry.gif.width.max(1) as f32;
+        let height = entry.gif.height.max(1) as f32;
+
+        (TILE_WIDTH * height / width).clamp(MIN_TILE_HEIGHT, MAX_TILE_HEIGHT)
+    }
+
+    /// Small badge shown on a tile to indicate whether a gif came from a
+    /// URL or was imported from a local folder.
+    fn source_icon(entry: &GifEntry) -> &'static str {
+        if entry.gif.source_type == "url" {
+            "☁"
+        } else {
+            "💾"
+        }
+    }
+
+    fn refresh_tag_stats(&mut self) {
+        self.tag_stats = db::queries::list_tag_stats(&self.conn).unwrap_or_default();
+    }
+
+    fn files_total_size(entries: &[GifEntry]) -> u64 {
+        entries
+            .iter()
+            .filter_map(|entry| entry.gif.local_cache_path.as_deref())
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .sum()
+    }
+
+    /// Recomputes the numbers shown on the Stats screen from what's already
+    /// loaded in memory (entries + deleted_entries), plus a disk size lookup
+    /// per file. Cheap enough to call on every navigation to that screen.
+    fn refresh_stats(&mut self) {
+        let local_count =
+            self.entries.iter().filter(|entry| entry.gif.source_type != "url").count();
+
+        self.stats = LibraryStats {
+            gif_count: self.entries.len(),
+            total_size_bytes: Self::files_total_size(&self.entries),
+            local_count,
+            url_count: self.entries.len() - local_count,
+            total_copies: self.entries.iter().map(|entry| entry.gif.use_count).sum(),
+            trash_count: self.deleted_entries.len(),
+            trash_size_bytes: Self::files_total_size(&self.deleted_entries),
+        };
+    }
+
+    fn format_bytes(bytes: u64) -> String {
+        const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+
+        let mut size = bytes as f64;
+        let mut unit_index = 0;
+
+        while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+            size /= 1024.0;
+            unit_index += 1;
         }
 
-        self.entries
-            .iter()
-            .filter(|entry| {
-                entry
-                    .tags
-                    .iter()
-                    .any(|tag| tag.to_lowercase().contains(&filter))
-            })
+        if unit_index == 0 {
+            format!("{bytes} B")
+        } else {
+            format!("{size:.1} {}", UNITS[unit_index])
+        }
+    }
+
+    /// The most-used tags, for the quick-filter chips under the search box.
+    fn popular_tags(&self) -> Vec<&str> {
+        let mut stats: Vec<&(String, i64)> =
+            self.tag_stats.iter().filter(|(_, count)| *count > 0).collect();
+        stats.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        stats
+            .into_iter()
+            .take(POPULAR_TAGS_LIMIT)
+            .map(|(name, _)| name.as_str())
             .collect()
+    }
+
+    /// Recomputes the best autocomplete suggestion for the tag currently
+    /// being typed, preferring the most-used matching tag.
+    fn update_tag_suggestion(&mut self) {
+        let draft = self.tag_draft.trim().to_lowercase();
+
+        if draft.is_empty() {
+            self.tag_suggestion = None;
+            return;
+        }
+
+        let mut candidates: Vec<&(String, i64)> = self
+            .tag_stats
+            .iter()
+            .filter(|(name, _)| {
+                name.to_lowercase().starts_with(&draft)
+                    && !self
+                        .staged_tags
+                        .iter()
+                        .any(|staged| staged.eq_ignore_ascii_case(name))
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        self.tag_suggestion = candidates.first().map(|(name, _)| name.clone());
+    }
+
+    fn push_staged_tag(&mut self, tag: &str) {
+        let tag = tag.trim();
+
+        if tag.is_empty() {
+            return;
+        }
+
+        if self.staged_tags.iter().any(|staged| staged.eq_ignore_ascii_case(tag)) {
+            return;
+        }
+
+        self.staged_tags.push(tag.to_string());
+    }
+
+    /// Commits whatever is currently typed in the tag draft as a new pill.
+    fn commit_tag_draft(&mut self) {
+        let tag = std::mem::take(&mut self.tag_draft);
+        self.push_staged_tag(&tag);
+        self.tag_suggestion = None;
+    }
+
+    fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some((message.into(), Instant::now()));
+    }
+
+    /// Recomputes which gifs currently fall within (or near) the visible
+    /// viewport, so only those keep animating.
+    fn recompute_visible(&mut self) {
+        let indices = self.filtered_indices();
+        let heights: Vec<f32> = indices
+            .iter()
+            .map(|&index| Self::tile_height_for(&self.entries[index]))
+            .collect();
+        let placements = compute_layout(&heights);
+
+        let top = self.scroll_offset - VISIBILITY_MARGIN;
+        let bottom = self.scroll_offset + self.viewport_height + VISIBILITY_MARGIN;
+
+        let new_visible: HashSet<i64> = indices
+            .iter()
+            .zip(placements.iter())
+            .filter(|(_, placement)| {
+                placement.y_offset + placement.height >= top && placement.y_offset <= bottom
+            })
+            .map(|(&index, _)| self.entries[index].gif.id)
+            .collect();
+
+        let newly_visible: Vec<i64> =
+            new_visible.iter().filter(|id| !self.visible_gif_ids.contains(id)).copied().collect();
+
+        self.visible_gif_ids = new_visible;
+
+        if !newly_visible.is_empty() {
+            self.ensure_decoded(&newly_visible);
+        }
     }
 
     fn store_local_file(original: &PathBuf, mode: &ImportMode) -> Result<PathBuf, String> {
@@ -174,10 +642,167 @@ impl App {
         Ok(destination)
     }
 
+    /// Bundles the database and every stored gif file into a single zip, so
+    /// the whole library can be backed up or moved to another computer.
+    fn write_backup_zip(destination: &Path) -> Result<(), String> {
+        let file = std::fs::File::create(destination).map_err(|e| e.to_string())?;
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        let db_bytes = std::fs::read(db::db_path())
+            .map_err(|e| format!("Failed to read database: {e}"))?;
+        writer
+            .start_file("gifs.db", options)
+            .map_err(|e| e.to_string())?;
+        writer.write_all(&db_bytes).map_err(|e| e.to_string())?;
+
+        let gifs_dir = db::gifs_storage_dir();
+        for entry in std::fs::read_dir(&gifs_dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if !entry.file_type().map_err(|e| e.to_string())?.is_file() {
+                continue;
+            }
+
+            let bytes = std::fs::read(entry.path()).map_err(|e| e.to_string())?;
+            let name = format!("gifs/{}", entry.file_name().to_string_lossy());
+            writer.start_file(name, options).map_err(|e| e.to_string())?;
+            writer.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+
+        writer.finish().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Replaces the current database and gif files with the contents of a
+    /// backup zip (see [`Self::write_backup_zip`]). Destructive: meant to be
+    /// called only after the user has confirmed the overwrite.
+    fn restore_backup(&mut self, zip_path: &Path) -> Result<(), String> {
+        let data_dir = db::gifs_storage_dir()
+            .parent()
+            .ok_or("Could not determine app data directory")?
+            .to_path_buf();
+        // Extracted on the same volume as the app data dir so the gif files
+        // can be moved into place with a cheap rename instead of a copy.
+        let temp_dir = data_dir.join(format!(".restore-{}", uuid::Uuid::new_v4()));
+
+        let zip_file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(zip_file).map_err(|e| e.to_string())?;
+        archive.extract(&temp_dir).map_err(|e| e.to_string())?;
+
+        let extracted_db = temp_dir.join("gifs.db");
+        if !extracted_db.exists() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err("The zip file doesn't contain a gifs.db".to_string());
+        }
+
+        let target_gifs_dir = db::gifs_storage_dir();
+        let _ = std::fs::remove_dir_all(&target_gifs_dir);
+        std::fs::create_dir_all(&target_gifs_dir).map_err(|e| e.to_string())?;
+
+        let extracted_gifs_dir = temp_dir.join("gifs");
+        if extracted_gifs_dir.exists() {
+            for entry in std::fs::read_dir(&extracted_gifs_dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let dest = target_gifs_dir.join(entry.file_name());
+                std::fs::rename(entry.path(), dest).map_err(|e| e.to_string())?;
+            }
+        }
+
+        std::fs::copy(&extracted_db, db::db_path()).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        self.conn = db::init_db();
+        self.entries = Self::load_entries(&self.conn);
+        self.load_deleted_entries();
+        self.app_theme = AppTheme::from_setting(
+            db::queries::get_setting(&self.conn, "theme").ok().flatten().as_deref(),
+        );
+        self.recompute_visible();
+        self.refresh_tag_stats();
+
+        Ok(())
+    }
+
+    /// Puts the actual gif file on the system clipboard (the same way
+    /// Finder's Cmd+C on a file does), so it can be pasted directly into
+    /// chat apps, Mail, Notes, etc. without losing the animation.
+    #[cfg(target_os = "macos")]
+    fn copy_file_to_clipboard(path: &str) -> bool {
+        let script = format!(
+            "set the clipboard to (POSIX file \"{}\")",
+            path.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+
+        match std::process::Command::new("osascript").arg("-e").arg(script).output() {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "Failed to copy file to clipboard: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(err) => {
+                eprintln!("Failed to copy file to clipboard: {err}");
+                false
+            }
+        }
+    }
+
+    // NOTE: written from documentation/memory, not verified on a real
+    // Windows machine or toolchain (none available in this environment) —
+    // please sanity-check that pasting actually works before relying on it.
+    #[cfg(target_os = "windows")]
+    fn copy_file_to_clipboard(path: &str) -> bool {
+        use clipboard_win::{formats, set_clipboard};
+
+        match set_clipboard(formats::FileList, [path]) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("Failed to copy file to clipboard: {err}");
+                false
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn copy_file_to_clipboard(_path: &str) -> bool {
+        eprintln!("Copying a file to the clipboard isn't implemented on this platform yet");
+        false
+    }
+
+    fn theme(&self) -> Theme {
+        self.app_theme.to_iced_theme()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let mut subs = Vec::new();
+
+        // Ticking is only useful while gif tiles are actually animating on
+        // screen; without this, the app kept redrawing at ~25fps forever —
+        // even while sitting on the Trash/Stats/Settings screen — because
+        // `entries` is non-empty the moment you've imported anything.
+        let animating = self.view_mode == ViewMode::Library && !self.visible_gif_ids.is_empty();
+
+        if animating || self.toast.is_some() {
+            subs.push(iced::time::every(Duration::from_millis(50)).map(Message::Tick));
+        }
+
+        // Only listen for Tab while there is something to complete, so we
+        // don't hijack Tab-based focus navigation the rest of the time.
+        if self.show_import_modal && self.tag_suggestion.is_some() {
+            subs.push(keyboard::listen().map(Message::TagInputKey));
+        }
+
+        Subscription::batch(subs)
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::FilterChanged(value) => {
                 self.filter_input = value;
+                self.recompute_visible();
             }
             Message::ShowImportModal => {
                 self.reset_modal_state();
@@ -201,7 +826,8 @@ impl App {
             Message::FileSelected(path) => {
                 if let Some(path) = path {
                     let path_str = path.to_string_lossy().to_string();
-                    self.pending_thumbnail = thumbnail::load_thumbnail(&path_str);
+                    self.pending_thumbnail = thumbnail::load_animation(&path_str)
+                        .map(|animation| animation.frames[0].clone());
                     self.pending_file = Some(path);
                     self.import_error = None;
                 }
@@ -226,7 +852,8 @@ impl App {
                 match result {
                     Ok(stored_path) => {
                         let stored_path_str = stored_path.to_string_lossy().to_string();
-                        self.pending_thumbnail = thumbnail::load_thumbnail(&stored_path_str);
+                        self.pending_thumbnail = thumbnail::load_animation(&stored_path_str)
+                            .map(|animation| animation.frames[0].clone());
                         self.staged_gif = Some(StagedGif {
                             source_type: "url".to_string(),
                             source_path: self.url_input.trim().to_string(),
@@ -238,8 +865,48 @@ impl App {
                     }
                 }
             }
-            Message::ModalTagsChanged(value) => {
-                self.modal_tags_input = value;
+            Message::TagDraftChanged(value) => {
+                if value.contains(',') {
+                    let parts: Vec<&str> = value.split(',').collect();
+                    let last = parts.len() - 1;
+
+                    for part in &parts[..last] {
+                        self.push_staged_tag(part);
+                    }
+
+                    self.tag_draft = parts[last].to_string();
+                } else {
+                    self.tag_draft = value;
+                }
+
+                self.update_tag_suggestion();
+            }
+            Message::CommitTagDraft => {
+                self.commit_tag_draft();
+            }
+            Message::RemoveStagedTag(index) => {
+                if index < self.staged_tags.len() {
+                    self.staged_tags.remove(index);
+                }
+            }
+            Message::TagInputKey(event) => {
+                if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    ..
+                } = event
+                {
+                    if let Some(suggestion) = self.tag_suggestion.clone() {
+                        self.tag_draft = suggestion;
+                        self.update_tag_suggestion();
+                        // Otherwise the cursor stays where "c" ended and typing
+                        // resumes mid-word instead of after the completed tag.
+                        return iced::widget::operation::move_cursor_to_end(TAG_DRAFT_INPUT_ID);
+                    }
+                }
+            }
+            Message::PopularTagClicked(tag_name) => {
+                self.filter_input = tag_name;
+                self.recompute_visible();
             }
             Message::ImportModeChanged(mode) => {
                 self.import_mode = mode;
@@ -258,11 +925,18 @@ impl App {
                     )
                     .expect("could not insert gif");
 
-                    db::queries::set_tags_for_gif(&self.conn, gif_id, &self.modal_tags_input)
+                    db::queries::set_tags_for_gif(&self.conn, gif_id, &self.staged_tags.join(","))
                         .expect("could not save tags");
 
-                    self.entries = Self::load_entries(&self.conn);
+                    if let Some((width, height)) = thumbnail::peek_dimensions(&stored_path_str) {
+                        let _ = db::queries::set_gif_dimensions(&self.conn, gif_id, width, height);
+                    }
+
+                    self.push_new_entry(gif_id);
                     self.reset_modal_state();
+                    self.recompute_visible();
+                    self.refresh_tag_stats();
+                    self.show_toast("Gif added");
                     return Task::none();
                 }
 
@@ -286,16 +960,232 @@ impl App {
                             db::queries::set_tags_for_gif(
                                 &self.conn,
                                 gif_id,
-                                &self.modal_tags_input,
+                                &self.staged_tags.join(","),
                             )
                             .expect("could not save tags");
 
-                            self.entries = Self::load_entries(&self.conn);
+                            if let Some((width, height)) =
+                                thumbnail::peek_dimensions(&stored_path_str)
+                            {
+                                let _ =
+                                    db::queries::set_gif_dimensions(&self.conn, gif_id, width, height);
+                            }
+
+                            self.push_new_entry(gif_id);
                             self.reset_modal_state();
+                            self.recompute_visible();
+                            self.refresh_tag_stats();
+                            self.show_toast("Gif added");
                         }
                         Err(err) => {
                             self.import_error = Some(err);
                         }
+                    }
+                }
+            }
+            Message::MoveToTrash(gif_id) => {
+                // The file on disk is left alone so the gif can still be
+                // restored later; only permanent deletion removes it. The
+                // entry is moved between the in-memory lists directly
+                // (instead of reloading and re-decoding everything) so this
+                // stays instant regardless of library size.
+                match db::queries::soft_delete_gif(&self.conn, gif_id) {
+                    Ok(()) => {
+                        if let Some(pos) = self.entries.iter().position(|entry| entry.gif.id == gif_id) {
+                            let mut entry = self.entries.remove(pos);
+                            if let Ok(gif) = db::queries::get_gif(&self.conn, gif_id) {
+                                entry.gif = gif;
+                            }
+                            self.deleted_entries.insert(0, entry);
+                        }
+                        self.detail_gif_id = None;
+                        self.recompute_visible();
+                        self.refresh_tag_stats();
+                        self.show_toast("Moved to trash");
+                    }
+                    Err(err) => eprintln!("Failed to trash gif {gif_id}: {err}"),
+                }
+            }
+            Message::RestoreGif(gif_id) => {
+                match db::queries::restore_gif(&self.conn, gif_id) {
+                    Ok(()) => {
+                        if let Some(pos) =
+                            self.deleted_entries.iter().position(|entry| entry.gif.id == gif_id)
+                        {
+                            let mut entry = self.deleted_entries.remove(pos);
+                            if let Ok(gif) = db::queries::get_gif(&self.conn, gif_id) {
+                                entry.gif = gif;
+                            }
+                            self.entries.insert(0, entry);
+                        }
+                        self.recompute_visible();
+                        self.refresh_tag_stats();
+                        self.show_toast("Restored");
+                    }
+                    Err(err) => eprintln!("Failed to restore gif {gif_id}: {err}"),
+                }
+            }
+            Message::PermanentlyDeleteGif(gif_id) => {
+                if let Some(pos) =
+                    self.deleted_entries.iter().position(|entry| entry.gif.id == gif_id)
+                {
+                    let entry = self.deleted_entries.remove(pos);
+                    if let Some(path) = &entry.gif.local_cache_path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    thumbnail::remove_cache(gif_id, &db::cache_dir());
+                }
+
+                match db::queries::permanently_delete_gif(&self.conn, gif_id) {
+                    Ok(()) => {
+                        self.refresh_tag_stats();
+                        self.show_toast("Deleted permanently");
+                    }
+                    Err(err) => eprintln!("Failed to permanently delete gif {gif_id}: {err}"),
+                }
+            }
+            Message::EmptyTrash => {
+                let cache_dir = db::cache_dir();
+                for entry in self.deleted_entries.drain(..) {
+                    if let Some(path) = &entry.gif.local_cache_path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    thumbnail::remove_cache(entry.gif.id, &cache_dir);
+                    let _ = db::queries::permanently_delete_gif(&self.conn, entry.gif.id);
+                }
+
+                self.refresh_tag_stats();
+                self.show_toast("Trash emptied");
+            }
+            Message::CopyGifFile(gif_id) => {
+                let path = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.gif.id == gif_id)
+                    .and_then(|entry| entry.gif.local_cache_path.clone());
+
+                if let Some(path) = path {
+                    if Self::copy_file_to_clipboard(&path) {
+                        if let Some(entry) =
+                            self.entries.iter_mut().find(|entry| entry.gif.id == gif_id)
+                        {
+                            entry.gif.use_count += 1;
+                        }
+                        let _ = db::queries::increment_use_count(&self.conn, gif_id);
+                        self.recompute_visible();
+                        self.show_toast("Copied to clipboard");
+                    }
+                }
+            }
+            Message::ShowDetail(gif_id) => {
+                self.detail_gif_id = Some(gif_id);
+            }
+            Message::HideDetail => {
+                self.detail_gif_id = None;
+            }
+            Message::SetViewMode(mode) => {
+                self.view_mode = mode;
+                if mode == ViewMode::Stats {
+                    self.refresh_stats();
+                }
+            }
+            Message::SortModeChanged(mode) => {
+                self.sort_mode = mode;
+                self.recompute_visible();
+            }
+            Message::ThemeChanged(theme) => {
+                self.app_theme = theme;
+                let _ = db::queries::set_setting(&self.conn, "theme", theme.as_setting());
+                self.show_toast("Theme updated");
+            }
+            Message::ExportBackup => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_file_name("gifvault-backup.zip")
+                            .add_filter("Zip archive", &["zip"])
+                            .save_file()
+                            .await
+                            .map(|handle| handle.path().to_path_buf())
+                    },
+                    Message::ExportDestinationChosen,
+                );
+            }
+            Message::ExportDestinationChosen(path) => {
+                if let Some(path) = path {
+                    match Self::write_backup_zip(&path) {
+                        Ok(()) => self.show_toast("Backup exported"),
+                        Err(err) => {
+                            eprintln!("Backup export failed: {err}");
+                            self.show_toast("Backup export failed");
+                        }
+                    }
+                }
+            }
+            Message::ImportBackupClicked => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("Zip archive", &["zip"])
+                            .pick_file()
+                            .await
+                            .map(|handle| handle.path().to_path_buf())
+                    },
+                    Message::ImportZipChosen,
+                );
+            }
+            Message::ImportZipChosen(path) => {
+                self.pending_import_zip = path;
+            }
+            Message::CancelImportBackup => {
+                self.pending_import_zip = None;
+            }
+            Message::ConfirmImportBackup => {
+                if let Some(path) = self.pending_import_zip.take() {
+                    match self.restore_backup(&path) {
+                        Ok(()) => self.show_toast("Library restored from backup"),
+                        Err(err) => {
+                            eprintln!("Backup import failed: {err}");
+                            self.show_toast("Backup import failed");
+                        }
+                    }
+                }
+            }
+            Message::Scrolled(viewport) => {
+                self.scroll_offset = viewport.absolute_offset().y;
+                self.viewport_height = viewport.bounds().height;
+                self.recompute_visible();
+            }
+            Message::Tick(now) => {
+                let elapsed_ms = self
+                    .last_tick
+                    .map(|last| (now - last).as_millis() as u64)
+                    .unwrap_or(0);
+                self.last_tick = Some(now);
+
+                let toast_expired = self.toast.as_ref().is_some_and(|(_, shown_at)| {
+                    now.duration_since(*shown_at) >= Duration::from_millis(TOAST_DURATION_MS)
+                });
+                if toast_expired {
+                    self.toast = None;
+                }
+
+                for entry in self.entries.iter_mut() {
+                    if !self.visible_gif_ids.contains(&entry.gif.id) {
+                        continue;
+                    }
+
+                    let Some(animation) = entry.animation.as_ref() else {
+                        continue;
+                    };
+                    if animation.frames.len() <= 1 {
+                        continue;
+                    }
+
+                    entry.frame_elapsed_ms += elapsed_ms;
+                    while entry.frame_elapsed_ms >= animation.delays_ms[entry.current_frame] {
+                        entry.frame_elapsed_ms -= animation.delays_ms[entry.current_frame];
+                        entry.current_frame = (entry.current_frame + 1) % animation.frames.len();
                     }
                 }
             }
@@ -304,61 +1194,501 @@ impl App {
         Task::none()
     }
 
-    fn view(&self) -> Element<Message> {
-        let visible_entries = self.filtered_entries();
+    fn build_tile(entry: &GifEntry, height: f32) -> Element<Message> {
+        let gif_id = entry.gif.id;
 
-        let gif_list: Element<Message> = if visible_entries.is_empty() {
+        let image_element: Element<Message> = match &entry.animation {
+            Some(animation) if !animation.frames.is_empty() => {
+                let frame_index = entry.current_frame.min(animation.frames.len() - 1);
+                image(animation.frames[frame_index].clone())
+                    .width(Length::Fixed(TILE_WIDTH))
+                    .height(Length::Fixed(height))
+                    .content_fit(ContentFit::Cover)
+                    .into()
+            }
+            // Not decoded (yet): hand the raw path to iced, which decodes
+            // and caches a static preview lazily on its own, off our plate
+            // entirely, instead of us decoding frames nobody is animating.
+            _ => {
+                let path = entry.gif.local_cache_path.as_deref().unwrap_or(&entry.gif.source_path);
+                image(Handle::from_path(path))
+                    .width(Length::Fixed(TILE_WIDTH))
+                    .height(Length::Fixed(height))
+                    .content_fit(ContentFit::Cover)
+                    .into()
+            }
+        };
+
+        let clickable: Element<Message> =
+            mouse_area(image_element).on_press(Message::CopyGifFile(gif_id)).into();
+
+        let menu_button = container(
+            button(text("⋮").size(18))
+                .on_press(Message::ShowDetail(gif_id))
+                .padding(4)
+                .style(button::secondary),
+        )
+        .align_right(Length::Fixed(TILE_WIDTH))
+        .align_top(Length::Fixed(height))
+        .padding(6);
+
+        let source_badge = container(
+            container(text(Self::source_icon(entry)).size(14))
+                .padding(4)
+                .style(container::rounded_box),
+        )
+        .align_left(Length::Fixed(TILE_WIDTH))
+        .align_bottom(Length::Fixed(height))
+        .padding(6);
+
+        stack![clickable, menu_button, source_badge].into()
+    }
+
+    fn view(&self) -> Element<Message> {
+        let page = match self.view_mode {
+            ViewMode::Library => self.library_view(),
+            ViewMode::Trash => self.trash_view(),
+            ViewMode::Stats => self.stats_view(),
+            ViewMode::Settings => self.settings_view(),
+        };
+
+        let base = row![self.sidebar_view(), page];
+
+        let content: Element<Message> = if let Some(gif_id) = self.detail_gif_id {
+            modal(base, self.detail_overlay_content(gif_id), Message::HideDetail)
+        } else if let Some(path) = &self.pending_import_zip {
+            modal(base, Self::import_confirm_content(path), Message::CancelImportBackup)
+        } else if self.show_import_modal {
+            modal(base, self.import_modal_content(), Message::HideImportModal)
+        } else {
+            base.into()
+        };
+
+        match &self.toast {
+            Some((message, _)) => stack![content, Self::toast_overlay(message)].into(),
+            None => content,
+        }
+    }
+
+    fn sidebar_view(&self) -> Element<Message> {
+        let nav_button = |label: &'static str, mode: ViewMode, active: bool| {
+            button(text(label).size(14))
+                .on_press(Message::SetViewMode(mode))
+                .width(Length::Fill)
+                .style(if active { button::primary } else { button::text })
+        };
+
+        container(
+            column![
+                text("GifVault").size(20),
+                column![
+                    nav_button("Library", ViewMode::Library, self.view_mode == ViewMode::Library),
+                    nav_button("Trash", ViewMode::Trash, self.view_mode == ViewMode::Trash),
+                    nav_button("Stats", ViewMode::Stats, self.view_mode == ViewMode::Stats),
+                ]
+                .spacing(4),
+                container(column![]).height(Length::Fill),
+                nav_button(
+                    "Settings",
+                    ViewMode::Settings,
+                    self.view_mode == ViewMode::Settings
+                ),
+            ]
+            .spacing(16)
+            .padding(16)
+            .width(Length::Fixed(160.0))
+            .height(Length::Fill),
+        )
+        .style(container::rounded_box)
+        .into()
+    }
+
+    fn library_view(&self) -> Element<Message> {
+        let indices = self.filtered_indices();
+
+        let grid: Element<Message> = if indices.is_empty() {
             text("No gifs match this filter").into()
         } else {
-            visible_entries
+            let heights: Vec<f32> = indices
+                .iter()
+                .map(|&index| Self::tile_height_for(&self.entries[index]))
+                .collect();
+            let placements = compute_layout(&heights);
+
+            let mut column_children: Vec<Vec<Element<Message>>> =
+                (0..GRID_COLUMNS).map(|_| Vec::new()).collect();
+
+            for (position, &entry_index) in indices.iter().enumerate() {
+                let placement = &placements[position];
+                let entry = &self.entries[entry_index];
+                column_children[placement.column].push(Self::build_tile(entry, placement.height));
+            }
+
+            row(column_children
                 .into_iter()
-                .fold(column![], |col, entry| {
+                .map(|children| column(children).spacing(TILE_SPACING).into()))
+            .spacing(TILE_SPACING)
+            .width(Length::Fill)
+            .into()
+        };
+
+        let popular_tags = self.popular_tags();
+        let popular_tags_row: Element<Message> = if popular_tags.is_empty() {
+            column![].into()
+        } else {
+            row(popular_tags.into_iter().map(|tag| {
+                button(text(tag).size(12))
+                    .on_press(Message::PopularTagClicked(tag.to_string()))
+                    .style(button::secondary)
+                    .padding(6)
+                    .into()
+            }))
+            .spacing(6)
+            .into()
+        };
+
+        let sort_row = row(SortMode::ALL.iter().map(|&mode| {
+            button(text(mode.label()).size(12))
+                .on_press(Message::SortModeChanged(mode))
+                .style(if self.sort_mode == mode {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+                .padding(6)
+                .into()
+        }))
+        .spacing(6);
+
+        column![
+            text("Library").size(26),
+            text_input("Filter by tag...", &self.filter_input)
+                .on_input(Message::FilterChanged)
+                .width(Length::Fill),
+            popular_tags_row,
+            sort_row,
+            button("Add gif").on_press(Message::ShowImportModal),
+            scrollable(grid)
+                .on_scroll(Message::Scrolled)
+                .height(Length::Fill)
+                .width(Length::Fill),
+        ]
+        .spacing(10)
+        .padding(20)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn trash_view(&self) -> Element<Message> {
+        let body: Element<Message> = if self.deleted_entries.is_empty() {
+            text("Trash is empty").into()
+        } else {
+            let rows: Vec<Element<Message>> = self
+                .deleted_entries
+                .iter()
+                .map(|entry| {
+                    let thumb: Element<Message> = match &entry.animation {
+                        Some(animation) if !animation.frames.is_empty() => {
+                            image(animation.frames[0].clone())
+                                .width(Length::Fixed(70.0))
+                                .height(Length::Fixed(70.0))
+                                .content_fit(ContentFit::Cover)
+                                .into()
+                        }
+                        _ => {
+                            let path = entry
+                                .gif
+                                .local_cache_path
+                                .as_deref()
+                                .unwrap_or(&entry.gif.source_path);
+                            image(Handle::from_path(path))
+                                .width(Length::Fixed(70.0))
+                                .height(Length::Fixed(70.0))
+                                .content_fit(ContentFit::Cover)
+                                .into()
+                        }
+                    };
+
                     let tags_line = if entry.tags.is_empty() {
                         "Tags: (none)".to_string()
                     } else {
                         format!("Tags: {}", entry.tags.join(", "))
                     };
 
-                    let info =
-                        column![text(&entry.gif.source_path), text(tags_line)].width(Length::Fill);
+                    let deleted_line = format!(
+                        "Deleted: {}",
+                        entry.gif.deleted_at.as_deref().unwrap_or("unknown")
+                    );
 
-                    let row_element: Element<Message> = match &entry.thumbnail {
-                        Some(handle) => row![image(handle.clone()).width(80).height(80), info]
-                            .spacing(10)
-                            .width(Length::Fill)
-                            .into(),
-                        None => row![text("(preview unavailable)"), info]
-                            .spacing(10)
-                            .width(Length::Fill)
-                            .into(),
-                    };
-
-                    col.push(row_element)
+                    container(
+                        row![
+                            thumb,
+                            column![text(tags_line), text(deleted_line).size(12)]
+                                .spacing(4)
+                                .width(Length::Fill),
+                            button("Restore").on_press(Message::RestoreGif(entry.gif.id)),
+                            button("Delete forever")
+                                .on_press(Message::PermanentlyDeleteGif(entry.gif.id))
+                                .style(button::danger),
+                        ]
+                        .spacing(12)
+                        .align_y(Center),
+                    )
+                    .padding(10)
+                    .style(container::rounded_box)
+                    .into()
                 })
-                .width(Length::Fill)
-                .spacing(15)
-                .into()
+                .collect();
+
+            scrollable(column(rows).spacing(10)).height(Length::Fill).into()
         };
 
-        let base = column![
-            text("GifVault"),
-            text(format!("Gifs in database: {}", self.entries.len())),
-            text_input("Filter by tag...", &self.filter_input)
-                .on_input(Message::FilterChanged)
-                .width(Length::Fill),
-            button("Add gif").on_press(Message::ShowImportModal),
-            scrollable(gif_list).height(Length::Fill).width(Length::Fill),
+        column![
+            row![
+                text("Trash").size(26),
+                container(column![]).width(Length::Fill),
+                button("Empty trash").on_press(Message::EmptyTrash).style(button::danger),
+            ]
+            .align_y(Center),
+            body,
         ]
-        .spacing(10)
+        .spacing(16)
         .padding(20)
         .width(Length::Fill)
-        .height(Length::Fill);
+        .height(Length::Fill)
+        .into()
+    }
 
-        if self.show_import_modal {
-            modal(base, self.import_modal_content(), Message::HideImportModal)
+    fn settings_view(&self) -> Element<Message> {
+        column![
+            text("Settings").size(26),
+            column![
+                text("Theme").size(14),
+                row![
+                    button("Light")
+                        .on_press(Message::ThemeChanged(AppTheme::Light))
+                        .style(if self.app_theme == AppTheme::Light {
+                            button::primary
+                        } else {
+                            button::secondary
+                        }),
+                    button("Dark")
+                        .on_press(Message::ThemeChanged(AppTheme::Dark))
+                        .style(if self.app_theme == AppTheme::Dark {
+                            button::primary
+                        } else {
+                            button::secondary
+                        }),
+                ]
+                .spacing(10),
+            ]
+            .spacing(8),
+            column![
+                text("Trash").size(14),
+                button("Empty trash").on_press(Message::EmptyTrash).style(button::danger),
+            ]
+            .spacing(8),
+            column![
+                text("Backup").size(14),
+                row![
+                    button("Export library").on_press(Message::ExportBackup),
+                    button("Import from zip").on_press(Message::ImportBackupClicked),
+                ]
+                .spacing(10),
+                text("Importing replaces your current library with the zip's contents.").size(12),
+            ]
+            .spacing(8),
+        ]
+        .spacing(24)
+        .padding(20)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn stats_view(&self) -> Element<Message> {
+        let stat_row = |label: &'static str, value: String| -> Element<'static, Message> {
+            row![text(label).width(Length::Fill), text(value)].into()
+        };
+
+        let rows = column![
+            stat_row("Gifs in library", self.stats.gif_count.to_string()),
+            stat_row("Total size on disk", Self::format_bytes(self.stats.total_size_bytes)),
+            stat_row("Imported from a folder", self.stats.local_count.to_string()),
+            stat_row("Imported from a URL", self.stats.url_count.to_string()),
+            stat_row("Clipboard copies (all time)", self.stats.total_copies.to_string()),
+            stat_row("Items in trash", self.stats.trash_count.to_string()),
+            stat_row("Reclaimable if trash is emptied", Self::format_bytes(self.stats.trash_size_bytes)),
+        ]
+        .spacing(12);
+
+        column![
+            text("Stats").size(26),
+            container(rows).padding(16).style(container::rounded_box),
+        ]
+        .spacing(16)
+        .padding(20)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn import_confirm_content(path: &Path) -> Element<'static, Message> {
+        container(
+            column![
+                text("Replace current library?").size(18),
+                text(format!(
+                    "This will overwrite your current gifs, tags and settings with the \
+                     contents of:\n{}",
+                    path.display()
+                ))
+                .size(13),
+                row![
+                    button("Cancel").on_press(Message::CancelImportBackup),
+                    button("Replace library")
+                        .on_press(Message::ConfirmImportBackup)
+                        .style(button::danger),
+                ]
+                .spacing(10),
+            ]
+            .spacing(12),
+        )
+        .padding(20)
+        .width(420)
+        .style(container::rounded_box)
+        .into()
+    }
+
+    /// Shows just the start of a (possibly very long) source link plus a
+    /// link icon, with the full value available on hover — the add-gif
+    /// screen doesn't need to be cluttered with a whole URL or file path.
+    fn truncated_source_label(source: &str) -> Element<'static, Message> {
+        const PREVIEW_CHARS: usize = 40;
+
+        let short = if source.chars().count() > PREVIEW_CHARS {
+            let prefix: String = source.chars().take(PREVIEW_CHARS).collect();
+            format!("{prefix}… 🔗")
         } else {
-            base.into()
+            format!("{source} 🔗")
+        };
+
+        tooltip(
+            text(short).size(13),
+            container(text(source.to_string()).size(13))
+                .padding(8)
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        )
+        .into()
+    }
+
+    fn toast_overlay(message: &str) -> Element<'_, Message> {
+        container(
+            container(text(message.to_string()))
+                .padding(10)
+                .style(container::rounded_box),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Center)
+        .align_y(Bottom)
+        .padding(30)
+        .into()
+    }
+
+    /// Lays tag pills out left-to-right, wrapping to a new line once a row
+    /// would overflow the modal's width (iced has no built-in wrap layout).
+    fn wrap_tag_pills(staged_tags: &[String]) -> Element<'_, Message> {
+        const MAX_ROW_WIDTH: f32 = 400.0;
+        const CHAR_WIDTH: f32 = 7.0;
+        const CHIP_OVERHEAD: f32 = 46.0;
+
+        let mut lines: Vec<Vec<Element<Message>>> = vec![Vec::new()];
+        let mut current_width = 0.0;
+
+        for (index, tag) in staged_tags.iter().enumerate() {
+            let chip_width = tag.chars().count() as f32 * CHAR_WIDTH + CHIP_OVERHEAD;
+
+            if current_width + chip_width > MAX_ROW_WIDTH && !lines.last().unwrap().is_empty() {
+                lines.push(Vec::new());
+                current_width = 0.0;
+            }
+
+            current_width += chip_width + 6.0;
+            lines.last_mut().unwrap().push(Self::tag_pill(index, tag));
         }
+
+        column(lines.into_iter().map(|line| row(line).spacing(6).into()))
+            .spacing(6)
+            .into()
+    }
+
+    fn tag_pill(index: usize, tag: &str) -> Element<'static, Message> {
+        container(
+            row![
+                text(tag.to_string()).size(13),
+                button(text("×").size(13))
+                    .on_press(Message::RemoveStagedTag(index))
+                    .padding(2)
+                    .style(button::text),
+            ]
+            .spacing(4)
+            .align_y(Center),
+        )
+        .padding(6)
+        .style(container::rounded_box)
+        .into()
+    }
+
+    fn detail_overlay_content(&self, gif_id: i64) -> Element<Message> {
+        let Some(entry) = self.entries.iter().find(|entry| entry.gif.id == gif_id) else {
+            return column![].into();
+        };
+
+        let preview: Element<Message> = match &entry.animation {
+            Some(animation) if !animation.frames.is_empty() => {
+                let frame_index = entry.current_frame.min(animation.frames.len() - 1);
+                image(animation.frames[frame_index].clone())
+                    .width(Length::Fixed(400.0))
+                    .content_fit(ContentFit::Contain)
+                    .into()
+            }
+            _ => {
+                let path = entry.gif.local_cache_path.as_deref().unwrap_or(&entry.gif.source_path);
+                image(Handle::from_path(path))
+                    .width(Length::Fixed(400.0))
+                    .content_fit(ContentFit::Contain)
+                    .into()
+            }
+        };
+
+        let tags_line = if entry.tags.is_empty() {
+            "Tags: (none)".to_string()
+        } else {
+            format!("Tags: {}", entry.tags.join(", "))
+        };
+
+        column![
+            preview,
+            text(format!("Added: {}", entry.gif.added_at)),
+            text(tags_line),
+            row![
+                text(Self::source_icon(entry)).size(16),
+                button("Copy file").on_press(Message::CopyGifFile(gif_id)),
+            ]
+            .spacing(8)
+            .align_y(Center),
+            row![
+                button("Move to trash")
+                    .on_press(Message::MoveToTrash(gif_id))
+                    .style(button::danger),
+                button("Close").on_press(Message::HideDetail),
+            ]
+            .spacing(10),
+        ]
+        .spacing(12)
+        .into()
     }
 
     fn import_modal_content(&self) -> Element<Message> {
@@ -406,13 +1736,27 @@ impl App {
                 None => column![].into(),
             };
 
+            let suggestion_hint: Element<Message> = match &self.tag_suggestion {
+                Some(suggestion) => text(format!("Tab → {suggestion}")).size(12).into(),
+                None => column![].into(),
+            };
+
+            let tags_section = column![
+                Self::wrap_tag_pills(&self.staged_tags),
+                text_input("Type a tag, Enter or comma to add...", &self.tag_draft)
+                    .id(TAG_DRAFT_INPUT_ID)
+                    .on_input(Message::TagDraftChanged)
+                    .on_submit(Message::CommitTagDraft)
+                    .width(Length::Fill),
+                suggestion_hint,
+            ]
+            .spacing(6);
+
             column![
                 preview,
-                text(source_label),
+                Self::truncated_source_label(&source_label),
                 mode_row,
-                text_input("Tags (comma separated)", &self.modal_tags_input)
-                    .on_input(Message::ModalTagsChanged)
-                    .width(Length::Fill),
+                tags_section,
                 error_text,
                 row![
                     button("Cancel").on_press(Message::HideImportModal),
@@ -484,6 +1828,8 @@ fn modal<'a>(
 fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
         .title("GifVault")
+        .subscription(App::subscription)
+        .theme(App::theme)
         .window(WindowSettings {
             size: Size::new(1000.0, 700.0),
             ..WindowSettings::default()

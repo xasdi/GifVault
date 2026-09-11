@@ -1,14 +1,44 @@
 [package]
 name = "GifVault"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
+# Used by `cargo bundle` to produce a double-clickable macOS .app in CI.
+[package.metadata.bundle]
+name = "GifVault"
+identifier = "com.yourcompany.gifvault"
+short_description = "A fast, local gif library manager."
+
 [dependencies]
-iced = { version = "0.14", features = ["wgpu", "tiny-skia", "image", "svg"] }
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "thread-pool",
+    "image-without-codecs",
+    "svg",
+    "tokio",
+] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 directories = "5"
 rfd = "0.15"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["gif", "png"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Not verified on a real Windows machine/toolchain — none available in this
+# environment. Sanity-check clipboard::copy_file_to_clipboard actually works
+# before relying on it.
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5"
+
+# Unoptimized (opt-level 0) builds make pixel-crunching code in our
+# dependencies — gif decoding, image resizing, tiny-skia's CPU rasterizer —
+# tens of times slower than release. opt-level 1 keeps debug builds fast to
+# recompile while making the app itself usable; without it, `cargo run`
+# spends tens of seconds just decoding a handful of gifs on startup.
+[profile.dev]
+opt-level = 1

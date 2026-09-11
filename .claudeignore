@@ -1,0 +1,17 @@
+# Rust/Cargo build output — large, regenerated, never worth reading
+target/
+**/*.rs.bk
+
+# Lockfile is mechanical/noisy for general browsing; still greppable
+# directly via Bash when an exact dependency version is needed.
+Cargo.lock
+
+# macOS
+.DS_Store
+
+# Editor/IDE local config
+.vscode/
+.idea/
+
+# VCS internals
+.git/

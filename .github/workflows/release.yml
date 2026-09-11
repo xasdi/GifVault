@@ -1,0 +1,84 @@
+name: Release
+
+# Runs when a version tag (e.g. "v1.0.0") is pushed. Builds GifVault for
+# macOS and Windows and attaches the ready-to-run files to a GitHub Release,
+# so anyone can grab one from the Releases page without installing Rust.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Build .app + .dmg
+        run: cargo bundle --release
+
+      - name: Rename .dmg for distribution
+        run: cp target/release/bundle/dmg/GifVault.dmg GifVault-macOS.dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GifVault-macOS
+          path: GifVault-macOS.dmg
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Rename executable
+        run: copy target\release\GifVault.exe GifVault-Windows.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GifVault-Windows
+          path: GifVault-Windows.exe
+
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download macOS build
+        uses: actions/download-artifact@v4
+        with:
+          name: GifVault-macOS
+
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: GifVault-Windows
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            GifVault-macOS.dmg
+            GifVault-Windows.exe
+          generate_release_notes: true

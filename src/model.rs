@@ -7,4 +7,8 @@ pub struct Gif {
     pub title: Option<String>,
     pub added_at: String,
     pub file_hash: Option<String>,
+    pub deleted_at: Option<String>,
+    pub use_count: i64,
+    pub width: i64,
+    pub height: i64,
 }
