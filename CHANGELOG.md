@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.4.0
+
+**Removed**
+- "Save as..." in the detail view — redundant with copying the file
+  directly, removed per feedback rather than kept as unused clutter
+
+**Fixed**
+- Tiles no longer crop a gif vertically when its aspect ratio is extreme
+  enough to hit the tile-height clamp — switched from Cover to Contain, so
+  the whole frame stays visible (letterboxed instead of cropped) rather
+  than losing the top/bottom of a tall gif
+- The grid now adapts its column count to the actual window width instead
+  of always being a fixed 3 columns
+
+**Library**
+- Clicking a popular tag now swaps the search to just that tag instead of
+  stacking onto whatever was already there — it's a quick "jump to this
+  category" shortcut, not another AND criterion, so browsing between
+  favorites can't accidentally empty the results. Clicking the active one
+  clears it; the active tag is highlighted.
+- Media filter: All / Gifs / Images, next to the sort buttons
+- "Add gif" now stands out with a "+" and the theme's accent color
+- Removed the per-tile cloud/disk source-of-import icon — not something
+  worth the visual noise
+
+**Stats**
+- Breakdown of animated (.gif) vs static image (png/jpg/webp) counts
+
 ## v1.3.0
 
 - "Reset filters" button — clears search criteria and puts sort back to

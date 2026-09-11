@@ -35,9 +35,10 @@ const SEARCH_DRAFT_INPUT_ID: &str = "search-draft-input";
 /// don't play, same as a single-frame gif wouldn't.
 const SUPPORTED_IMAGE_EXTENSIONS: [&str; 5] = ["gif", "png", "jpg", "jpeg", "webp"];
 
-const GRID_COLUMNS: usize = 3;
 const TILE_WIDTH: f32 = 280.0;
 const TILE_SPACING: f32 = 15.0;
+const SIDEBAR_WIDTH: f32 = 170.0;
+const LIBRARY_PADDING: f32 = 20.0;
 const MIN_TILE_HEIGHT: f32 = 140.0;
 const MAX_TILE_HEIGHT: f32 = 420.0;
 // Tiles within this many pixels of the viewport are also kept animated, so
@@ -102,6 +103,25 @@ impl TagSortMode {
             TagSortMode::Name => "Name",
             TagSortMode::MostUsed => "Most used",
             TagSortMode::LeastUsed => "Least used",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MediaFilter {
+    All,
+    Gifs,
+    Images,
+}
+
+impl MediaFilter {
+    const ALL: [MediaFilter; 3] = [MediaFilter::All, MediaFilter::Gifs, MediaFilter::Images];
+
+    fn label(self) -> &'static str {
+        match self {
+            MediaFilter::All => "All",
+            MediaFilter::Gifs => "Gifs",
+            MediaFilter::Images => "Images",
         }
     }
 }
@@ -197,6 +217,8 @@ struct LibraryStats {
     total_copies: i64,
     trash_count: usize,
     trash_size_bytes: u64,
+    animated_gif_format_count: usize,
+    static_image_format_count: usize,
 }
 
 struct App {
@@ -246,6 +268,8 @@ struct App {
     tag_search_input: String,
     tag_sort_mode: TagSortMode,
     pending_tag_delete: Option<String>,
+    window_width: f32,
+    media_filter: MediaFilter,
 }
 
 #[derive(Debug, Clone)]
@@ -255,8 +279,8 @@ enum Message {
     RemoveSearchTag(usize),
     SearchInputKey(keyboard::Event),
     ResetFilters,
-    SaveGifAs(i64),
-    SaveDestinationChosen(String, Option<PathBuf>),
+    WindowResized(f32),
+    MediaFilterChanged(MediaFilter),
     ShowImportModal,
     HideImportModal,
     PickFile,
@@ -323,8 +347,8 @@ struct TilePlacement {
 
 /// Greedily places each tile (in order) into the shortest column so far,
 /// producing a Pinterest-style masonry layout.
-fn compute_layout(heights: &[f32]) -> Vec<TilePlacement> {
-    let mut column_heights = [0.0f32; GRID_COLUMNS];
+fn compute_layout(heights: &[f32], columns: usize) -> Vec<TilePlacement> {
+    let mut column_heights = vec![0.0f32; columns.max(1)];
 
     heights
         .iter()
@@ -399,6 +423,8 @@ impl App {
             tag_search_input: String::new(),
             tag_sort_mode: TagSortMode::Name,
             pending_tag_delete: None,
+            window_width: 1000.0,
+            media_filter: MediaFilter::All,
         };
         Self::backfill_dimensions_for(&app.conn, &mut app.entries);
         Self::backfill_dimensions_for(&app.conn, &mut app.deleted_entries);
@@ -563,6 +589,17 @@ impl App {
                 .collect()
         };
 
+        if self.media_filter != MediaFilter::All {
+            indices.retain(|&index| {
+                let is_gif = Self::is_gif_file(&self.entries[index]);
+                match self.media_filter {
+                    MediaFilter::Gifs => is_gif,
+                    MediaFilter::Images => !is_gif,
+                    MediaFilter::All => true,
+                }
+            });
+        }
+
         indices.sort_by(|&a, &b| {
             let a = &self.entries[a].gif;
             let b = &self.entries[b].gif;
@@ -585,6 +622,21 @@ impl App {
         let height = entry.gif.height.max(1) as f32;
 
         (TILE_WIDTH * height / width).clamp(MIN_TILE_HEIGHT, MAX_TILE_HEIGHT)
+    }
+
+    /// How many tile columns fit the current window — the grid adapts to
+    /// window width instead of always being a fixed 3 columns.
+    fn grid_columns(&self) -> usize {
+        let available = self.window_width - SIDEBAR_WIDTH - LIBRARY_PADDING * 2.0;
+        (((available + TILE_SPACING) / (TILE_WIDTH + TILE_SPACING)).floor() as usize).max(1)
+    }
+
+    /// Format, not import source — a `.gif` file (even a single-frame one)
+    /// counts as a gif; everything else supported (png/jpg/webp) is an
+    /// "image" for filtering/stats purposes.
+    fn is_gif_file(entry: &GifEntry) -> bool {
+        let path = entry.gif.local_cache_path.as_deref().unwrap_or(&entry.gif.source_path);
+        Path::new(path).extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("gif")).unwrap_or(false)
     }
 
     /// Small badge shown on a tile to indicate whether a gif came from a
@@ -616,6 +668,8 @@ impl App {
     fn refresh_stats(&mut self) {
         let local_count =
             self.entries.iter().filter(|entry| entry.gif.source_type != "url").count();
+        let animated_gif_format_count =
+            self.entries.iter().filter(|entry| Self::is_gif_file(entry)).count();
 
         self.stats = LibraryStats {
             gif_count: self.entries.len(),
@@ -625,6 +679,8 @@ impl App {
             total_copies: self.entries.iter().map(|entry| entry.gif.use_count).sum(),
             trash_count: self.deleted_entries.len(),
             trash_size_bytes: Self::files_total_size(&self.deleted_entries),
+            animated_gif_format_count,
+            static_image_format_count: self.entries.len() - animated_gif_format_count,
         };
     }
 
@@ -761,7 +817,7 @@ impl App {
             .iter()
             .map(|&index| Self::tile_height_for(&self.entries[index]))
             .collect();
-        let placements = compute_layout(&heights);
+        let placements = compute_layout(&heights, self.grid_columns());
 
         let top = self.scroll_offset - VISIBILITY_MARGIN;
         let bottom = self.scroll_offset + self.viewport_height + VISIBILITY_MARGIN;
@@ -1050,6 +1106,11 @@ impl App {
             _ => None,
         }));
 
+        // Keeps the grid's column count in sync with the actual window
+        // width instead of a fixed count regardless of how the window is
+        // resized.
+        subs.push(iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size.width)));
+
         Subscription::batch(subs)
     }
 
@@ -1124,52 +1185,16 @@ impl App {
                 self.search_draft.clear();
                 self.search_suggestion = None;
                 self.sort_mode = SortMode::DateNewest;
+                self.media_filter = MediaFilter::All;
                 self.recompute_visible();
             }
-            Message::SaveGifAs(gif_id) => {
-                let Some(entry) = self.entries.iter().find(|entry| entry.gif.id == gif_id) else {
-                    return Task::none();
-                };
-                let Some(source) = entry.gif.local_cache_path.clone() else {
-                    return Task::none();
-                };
-
-                // Prefer the original filename (nice for a local import);
-                // fall back to the stored file's own name (a uuid, but at
-                // least it keeps the right extension) for URL downloads.
-                let default_name = Path::new(&entry.gif.source_path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| {
-                        Path::new(&source)
-                            .file_name()
-                            .map(|name| name.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "image".to_string())
-                    });
-
-                return Task::perform(
-                    async move {
-                        let destination = rfd::AsyncFileDialog::new()
-                            .set_file_name(&default_name)
-                            .save_file()
-                            .await
-                            .map(|handle| handle.path().to_path_buf());
-                        (source, destination)
-                    },
-                    |(source, destination)| Message::SaveDestinationChosen(source, destination),
-                );
+            Message::WindowResized(width) => {
+                self.window_width = width;
+                self.recompute_visible();
             }
-            Message::SaveDestinationChosen(source, destination) => {
-                if let Some(destination) = destination {
-                    match std::fs::copy(&source, &destination) {
-                        Ok(_) => self.show_toast("Saved"),
-                        Err(err) => {
-                            eprintln!("Failed to save file: {err}");
-                            self.show_toast("Failed to save file");
-                        }
-                    }
-                }
+            Message::MediaFilterChanged(filter) => {
+                self.media_filter = filter;
+                self.recompute_visible();
             }
             Message::ShowImportModal => {
                 self.reset_modal_state();
@@ -1281,7 +1306,19 @@ impl App {
                 }
             }
             Message::PopularTagClicked(tag_name) => {
-                self.push_search_tag(&tag_name);
+                // Purely a quick "jump to this category" shortcut, not
+                // another AND criterion to stack — clicking a different
+                // popular tag swaps the whole search instead of narrowing
+                // it further, and clicking the active one clears it. That
+                // way browsing between favorite tags never accidentally
+                // empties the results.
+                if self.search_tags == [tag_name.clone()] {
+                    self.search_tags.clear();
+                } else {
+                    self.search_tags = vec![tag_name];
+                }
+                self.search_draft.clear();
+                self.search_suggestion = None;
                 self.recompute_visible();
             }
             Message::ImportModeChanged(mode) => {
@@ -1764,7 +1801,14 @@ impl App {
                 image(animation.frames[frame_index].clone())
                     .width(Length::Fixed(TILE_WIDTH))
                     .height(Length::Fixed(height))
-                    .content_fit(ContentFit::Cover)
+                    // Contain, not Cover: a tile's height is clamped (see
+                    // tile_height_for) so one extreme aspect ratio can't
+                    // blow up the whole masonry layout — but that clamp
+                    // means the box doesn't always match the gif's real
+                    // ratio, and Cover would crop the mismatch away
+                    // (usually top/bottom of a tall gif). Contain letterboxes
+                    // instead, so the full frame is always visible.
+                    .content_fit(ContentFit::Contain)
                     .border_radius(8.0)
                     .into()
             }
@@ -1776,7 +1820,7 @@ impl App {
                 image(Handle::from_path(path))
                     .width(Length::Fixed(TILE_WIDTH))
                     .height(Length::Fixed(height))
-                    .content_fit(ContentFit::Cover)
+                    .content_fit(ContentFit::Contain)
                     .border_radius(8.0)
                     .into()
             }
@@ -1848,7 +1892,7 @@ impl App {
             );
         } else {
             let menu_button = container(
-                button(text("⋮").size(18))
+                button(text("⚙").size(16))
                     .on_press(Message::ShowDetail(gif_id))
                     .padding(4)
                     .style(button::secondary),
@@ -1857,17 +1901,7 @@ impl App {
             .align_top(Length::Fixed(height))
             .padding(6);
 
-            let source_badge = container(
-                container(text(Self::source_icon(entry)).size(14))
-                    .padding(4)
-                    .style(container::rounded_box),
-            )
-            .align_left(Length::Fixed(TILE_WIDTH))
-            .align_bottom(Length::Fixed(height))
-            .padding(6);
-
             layers.push(menu_button.into());
-            layers.push(source_badge.into());
         }
 
         stack(layers).into()
@@ -1955,10 +1989,11 @@ impl App {
                 .iter()
                 .map(|&index| Self::tile_height_for(&self.entries[index]))
                 .collect();
-            let placements = compute_layout(&heights);
+            let columns = self.grid_columns();
+            let placements = compute_layout(&heights, columns);
 
             let mut column_children: Vec<Vec<Element<Message>>> =
-                (0..GRID_COLUMNS).map(|_| Vec::new()).collect();
+                (0..columns).map(|_| Vec::new()).collect();
 
             for (position, &entry_index) in indices.iter().enumerate() {
                 let placement = &placements[position];
@@ -1984,9 +2019,10 @@ impl App {
             column![].into()
         } else {
             row(popular_tags.into_iter().map(|tag| {
+                let active = self.search_tags == [tag.to_string()];
                 button(text(tag).size(12))
                     .on_press(Message::PopularTagClicked(tag.to_string()))
-                    .style(button::secondary)
+                    .style(if active { button::primary } else { button::secondary })
                     .padding(6)
                     .into()
             }))
@@ -2007,13 +2043,24 @@ impl App {
         }))
         .spacing(6);
 
+        let media_filter_row = row(MediaFilter::ALL.iter().map(|&filter| {
+            button(text(filter.label()).size(12))
+                .on_press(Message::MediaFilterChanged(filter))
+                .style(if self.media_filter == filter { button::primary } else { button::secondary })
+                .padding(6)
+                .into()
+        }))
+        .spacing(6);
+
         let filters_row = row![
             sort_row,
+            media_filter_row,
             container(column![]).width(Length::Fill),
             button(text("Reset filters").size(12))
                 .on_press(Message::ResetFilters)
                 .style(button::text),
         ]
+        .spacing(10)
         .align_y(Center);
 
         let header = row![
@@ -2080,7 +2127,9 @@ impl App {
         .spacing(6);
 
         let add_gif_row = row![
-            button("Add gif").on_press(Message::ShowImportModal),
+            button(row![text("+").size(16), text("Add gif")].spacing(6).align_y(Center))
+                .on_press(Message::ShowImportModal)
+                .style(button::primary),
             container(column![]).width(Length::Fill),
             popular_tags_row,
         ]
@@ -2347,6 +2396,8 @@ impl App {
 
         let rows = column![
             stat_row("Gifs in library", self.stats.gif_count.to_string()),
+            stat_row("— animated (.gif format)", self.stats.animated_gif_format_count.to_string()),
+            stat_row("— static images (png/jpg/webp)", self.stats.static_image_format_count.to_string()),
             stat_row("Total size on disk", Self::format_bytes(self.stats.total_size_bytes)),
             stat_row("Imported from a folder", self.stats.local_count.to_string()),
             stat_row("Imported from a URL", self.stats.url_count.to_string()),
@@ -2592,7 +2643,6 @@ impl App {
                 row![
                     text(Self::source_icon(entry)).size(16),
                     button("Copy file").on_press(Message::CopyGifFile(gif_id)),
-                    button("Save as...").on_press(Message::SaveGifAs(gif_id)).style(button::secondary),
                 ]
                 .spacing(8)
                 .align_y(Center),
