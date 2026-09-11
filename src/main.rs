@@ -254,6 +254,9 @@ enum Message {
     CommitSearchDraft,
     RemoveSearchTag(usize),
     SearchInputKey(keyboard::Event),
+    ResetFilters,
+    SaveGifAs(i64),
+    SaveDestinationChosen(String, Option<PathBuf>),
     ShowImportModal,
     HideImportModal,
     PickFile,
@@ -1116,6 +1119,58 @@ impl App {
                     }
                 }
             }
+            Message::ResetFilters => {
+                self.search_tags.clear();
+                self.search_draft.clear();
+                self.search_suggestion = None;
+                self.sort_mode = SortMode::DateNewest;
+                self.recompute_visible();
+            }
+            Message::SaveGifAs(gif_id) => {
+                let Some(entry) = self.entries.iter().find(|entry| entry.gif.id == gif_id) else {
+                    return Task::none();
+                };
+                let Some(source) = entry.gif.local_cache_path.clone() else {
+                    return Task::none();
+                };
+
+                // Prefer the original filename (nice for a local import);
+                // fall back to the stored file's own name (a uuid, but at
+                // least it keeps the right extension) for URL downloads.
+                let default_name = Path::new(&entry.gif.source_path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| {
+                        Path::new(&source)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "image".to_string())
+                    });
+
+                return Task::perform(
+                    async move {
+                        let destination = rfd::AsyncFileDialog::new()
+                            .set_file_name(&default_name)
+                            .save_file()
+                            .await
+                            .map(|handle| handle.path().to_path_buf());
+                        (source, destination)
+                    },
+                    |(source, destination)| Message::SaveDestinationChosen(source, destination),
+                );
+            }
+            Message::SaveDestinationChosen(source, destination) => {
+                if let Some(destination) = destination {
+                    match std::fs::copy(&source, &destination) {
+                        Ok(_) => self.show_toast("Saved"),
+                        Err(err) => {
+                            eprintln!("Failed to save file: {err}");
+                            self.show_toast("Failed to save file");
+                        }
+                    }
+                }
+            }
             Message::ShowImportModal => {
                 self.reset_modal_state();
                 self.show_import_modal = true;
@@ -1952,6 +2007,15 @@ impl App {
         }))
         .spacing(6);
 
+        let filters_row = row![
+            sort_row,
+            container(column![]).width(Length::Fill),
+            button(text("Reset filters").size(12))
+                .on_press(Message::ResetFilters)
+                .style(button::text),
+        ]
+        .align_y(Center);
+
         let header = row![
             text("Library").size(26),
             container(column![]).width(Length::Fill),
@@ -2015,13 +2079,20 @@ impl App {
         ]
         .spacing(6);
 
+        let add_gif_row = row![
+            button("Add gif").on_press(Message::ShowImportModal),
+            container(column![]).width(Length::Fill),
+            popular_tags_row,
+        ]
+        .spacing(10)
+        .align_y(Center);
+
         column![
             header,
             search_section,
-            popular_tags_row,
-            sort_row,
+            filters_row,
             selection_bar,
-            button("Add gif").on_press(Message::ShowImportModal),
+            add_gif_row,
             scrollable(grid)
                 .on_scroll(Message::Scrolled)
                 .height(Length::Fill)
@@ -2521,6 +2592,7 @@ impl App {
                 row![
                     text(Self::source_icon(entry)).size(16),
                     button("Copy file").on_press(Message::CopyGifFile(gif_id)),
+                    button("Save as...").on_press(Message::SaveGifAs(gif_id)).style(button::secondary),
                 ]
                 .spacing(8)
                 .align_y(Center),

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.3.0
+
+- "Reset filters" button — clears search criteria and puts sort back to
+  Newest in one click, instead of removing each search pill by hand
+- Popular-tag chips moved off the sort row and onto the same row as "Add
+  gif" (right-aligned), so they're not confused with the Newest/Oldest/etc.
+  sort controls
+- "Save as..." in the detail view: saves a copy of the gif/image to
+  wherever you pick, working for any of the supported formats
+
 ## v1.2.0
 
 **Memory**
