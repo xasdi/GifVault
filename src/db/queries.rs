@@ -43,6 +43,49 @@ pub fn set_tags_for_gif(conn: &Connection, gif_id: i64, tags_input: &str) -> Res
     Ok(())
 }
 
+/// Replaces a gif's tags with exactly the given set — unlike
+/// `set_tags_for_gif`, this also removes associations for tags that were
+/// unstaged, so it's suitable for editing an existing gif's tags rather
+/// than only ever adding to them.
+pub fn set_gif_tags_exact(conn: &Connection, gif_id: i64, tags: &[String]) -> Result<()> {
+    conn.execute("DELETE FROM gif_tags WHERE gif_id = ?1", [gif_id])?;
+    set_tags_for_gif(conn, gif_id, &tags.join(","))
+}
+
+/// Renames a tag. If `new_name` already exists, the two are merged instead:
+/// every gif tagged with `old_name` ends up tagged with the existing
+/// `new_name` tag, and the now-empty `old_name` row is removed.
+pub fn rename_or_merge_tag(conn: &Connection, old_name: &str, new_name: &str) -> Result<()> {
+    let old_id: i64 =
+        conn.query_row("SELECT id FROM tags WHERE name = ?1", [old_name], |row| row.get(0))?;
+
+    let existing_target: Option<i64> = conn
+        .query_row("SELECT id FROM tags WHERE name = ?1", [new_name], |row| row.get(0))
+        .ok();
+
+    match existing_target {
+        None => {
+            conn.execute("UPDATE tags SET name = ?1 WHERE id = ?2", (new_name, old_id))?;
+        }
+        Some(target_id) if target_id == old_id => {
+            // Renaming a tag to the name it already has: nothing to do.
+        }
+        Some(target_id) => {
+            // Reassign what we can; any gif that already has both ends up
+            // with a duplicate (gif_id, tag_id) pair, which the unique
+            // primary key rejects — those just get dropped instead below.
+            conn.execute(
+                "UPDATE OR IGNORE gif_tags SET tag_id = ?1 WHERE tag_id = ?2",
+                (target_id, old_id),
+            )?;
+            conn.execute("DELETE FROM gif_tags WHERE tag_id = ?1", [old_id])?;
+            conn.execute("DELETE FROM tags WHERE id = ?1", [old_id])?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Irreversibly removes a gif's row (and its tag links). Only meant to be
 /// called from the trash view, on a gif that is already soft-deleted.
 pub fn permanently_delete_gif(conn: &Connection, gif_id: i64) -> Result<()> {

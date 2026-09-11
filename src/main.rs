@@ -13,8 +13,12 @@ use iced::widget::{
     text_input, tooltip,
 };
 use iced::keyboard;
+use iced::theme::Palette;
 use iced::window::Settings as WindowSettings;
-use iced::{Bottom, Center, Color, ContentFit, Element, Length, Size, Subscription, Task, Theme};
+use iced::{
+    color, Bottom, Center, Color, ContentFit, Element, Font, Length, Size, Subscription, Task,
+    Theme,
+};
 use model::Gif;
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -97,10 +101,46 @@ impl AppTheme {
         }
     }
 
-    fn to_iced_theme(self) -> Theme {
+    /// A custom palette instead of iced's built-in Light/Dark, tuned closer
+    /// to a modern chat-app look (dark backgrounds a few shades apart from
+    /// each other rather than one flat gray, a blurple accent).
+    fn palette(self) -> Palette {
         match self {
-            AppTheme::Light => Theme::Light,
-            AppTheme::Dark => Theme::Dark,
+            AppTheme::Dark => Palette {
+                background: color!(0x31_33_38),
+                text: color!(0xdb_de_e1),
+                primary: color!(0x58_65_f2),
+                success: color!(0x23_a5_5a),
+                warning: color!(0xf0_b2_32),
+                danger: color!(0xed_42_45),
+            },
+            AppTheme::Light => Palette {
+                background: color!(0xff_ff_ff),
+                text: color!(0x06_06_07),
+                primary: color!(0x58_65_f2),
+                success: color!(0x23_a5_5a),
+                warning: color!(0xa9_7c_17),
+                danger: color!(0xda_37_3c),
+            },
+        }
+    }
+
+    fn to_iced_theme(self) -> Theme {
+        let name = match self {
+            AppTheme::Dark => "GifVault Dark",
+            AppTheme::Light => "GifVault Light",
+        };
+
+        Theme::custom(name, self.palette())
+    }
+
+    /// A background a couple of shades apart from the main content, used
+    /// for the sidebar and other "recessed" panels — the layered look most
+    /// modern chat/tool apps use instead of one flat background everywhere.
+    fn recessed_background(self) -> Color {
+        match self {
+            AppTheme::Dark => color!(0x2b_2d_31),
+            AppTheme::Light => color!(0xf2_f3_f5),
         }
     }
 }
@@ -161,6 +201,16 @@ struct App {
     toast: Option<(String, Instant)>,
     pending_import_zip: Option<PathBuf>,
     stats: LibraryStats,
+    pending_permanent_delete: Option<i64>,
+    /// Which gif's tags are currently being edited in the detail view, if
+    /// any — reuses `staged_tags`/`tag_draft`/`tag_suggestion` (the same
+    /// pill editor as the import flow), since only one of the two can ever
+    /// be open at once.
+    editing_tags_for: Option<i64>,
+    renaming_tag: Option<String>,
+    tag_rename_draft: String,
+    selection_mode: bool,
+    selected_ids: HashSet<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,16 +227,32 @@ enum Message {
     CommitTagDraft,
     RemoveStagedTag(usize),
     TagInputKey(keyboard::Event),
+    ModalKeyPressed(keyboard::Event),
     PopularTagClicked(String),
     ImportModeChanged(ImportMode),
     ConfirmImport,
     MoveToTrash(i64),
     RestoreGif(i64),
+    RequestPermanentDelete(i64),
+    CancelPermanentDelete,
     PermanentlyDeleteGif(i64),
     EmptyTrash,
     CopyGifFile(i64),
     ShowDetail(i64),
     HideDetail,
+    EditTagsClicked(i64),
+    SaveTagsEdit(i64),
+    CancelTagsEdit,
+    StartRenameTag(String),
+    TagRenameDraftChanged(String),
+    ConfirmRenameTag,
+    CancelRenameTag,
+    FileDropped(PathBuf),
+    ToggleSelectionMode,
+    ToggleTileSelected(i64),
+    BulkTagDraftChanged(String),
+    ApplyBulkTag,
+    BulkMoveToTrash,
     Scrolled(scrollable::Viewport),
     Tick(Instant),
     SetViewMode(ViewMode),
@@ -274,6 +340,12 @@ impl App {
             toast: None,
             pending_import_zip: None,
             stats: LibraryStats::default(),
+            pending_permanent_delete: None,
+            editing_tags_for: None,
+            renaming_tag: None,
+            tag_rename_draft: String::new(),
+            selection_mode: false,
+            selected_ids: HashSet::new(),
         };
         Self::backfill_dimensions_for(&app.conn, &mut app.entries);
         Self::backfill_dimensions_for(&app.conn, &mut app.deleted_entries);
@@ -811,11 +883,46 @@ impl App {
 
         // Only listen for Tab while there is something to complete, so we
         // don't hijack Tab-based focus navigation the rest of the time.
-        if self.show_import_modal && self.tag_suggestion.is_some() {
+        if (self.show_import_modal || self.editing_tags_for.is_some()) && self.tag_suggestion.is_some()
+        {
             subs.push(keyboard::listen().map(Message::TagInputKey));
         }
 
+        if self.any_modal_open() {
+            subs.push(keyboard::listen().map(Message::ModalKeyPressed));
+        }
+
+        // Always on: dropping a .gif file onto the window opens the import
+        // modal with it pre-selected, same as picking it from a dialog.
+        subs.push(iced::window::events().filter_map(|(_id, event)| match event {
+            iced::window::Event::FileDropped(path) => Some(Message::FileDropped(path)),
+            _ => None,
+        }));
+
         Subscription::batch(subs)
+    }
+
+    fn any_modal_open(&self) -> bool {
+        self.detail_gif_id.is_some()
+            || self.pending_import_zip.is_some()
+            || self.show_import_modal
+            || self.pending_permanent_delete.is_some()
+    }
+
+    /// Closes whichever overlay is currently on top, matching the priority
+    /// order `view()` uses to decide which one to render.
+    fn close_topmost_modal(&mut self) {
+        if self.editing_tags_for.is_some() {
+            self.editing_tags_for = None;
+        } else if self.detail_gif_id.is_some() {
+            self.detail_gif_id = None;
+        } else if self.pending_import_zip.is_some() {
+            self.pending_import_zip = None;
+        } else if self.show_import_modal {
+            self.reset_modal_state();
+        } else if self.pending_permanent_delete.is_some() {
+            self.pending_permanent_delete = None;
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -922,6 +1029,15 @@ impl App {
                         // resumes mid-word instead of after the completed tag.
                         return iced::widget::operation::move_cursor_to_end(TAG_DRAFT_INPUT_ID);
                     }
+                }
+            }
+            Message::ModalKeyPressed(event) => {
+                if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                } = event
+                {
+                    self.close_topmost_modal();
                 }
             }
             Message::PopularTagClicked(tag_name) => {
@@ -1045,7 +1161,15 @@ impl App {
                     Err(err) => eprintln!("Failed to restore gif {gif_id}: {err}"),
                 }
             }
+            Message::RequestPermanentDelete(gif_id) => {
+                self.pending_permanent_delete = Some(gif_id);
+            }
+            Message::CancelPermanentDelete => {
+                self.pending_permanent_delete = None;
+            }
             Message::PermanentlyDeleteGif(gif_id) => {
+                self.pending_permanent_delete = None;
+
                 if let Some(pos) =
                     self.deleted_entries.iter().position(|entry| entry.gif.id == gif_id)
                 {
@@ -1099,9 +1223,149 @@ impl App {
             }
             Message::ShowDetail(gif_id) => {
                 self.detail_gif_id = Some(gif_id);
+                self.editing_tags_for = None;
             }
             Message::HideDetail => {
                 self.detail_gif_id = None;
+                self.editing_tags_for = None;
+            }
+            Message::EditTagsClicked(gif_id) => {
+                if let Some(entry) = self.entries.iter().find(|entry| entry.gif.id == gif_id) {
+                    self.staged_tags = entry.tags.clone();
+                    self.tag_draft.clear();
+                    self.tag_suggestion = None;
+                    self.editing_tags_for = Some(gif_id);
+                }
+            }
+            Message::CancelTagsEdit => {
+                self.editing_tags_for = None;
+            }
+            Message::SaveTagsEdit(gif_id) => {
+                // Whatever's still sitting in the draft box counts too —
+                // saving shouldn't silently drop a tag the user typed but
+                // never pressed Enter/comma on.
+                self.commit_tag_draft();
+
+                match db::queries::set_gif_tags_exact(&self.conn, gif_id, &self.staged_tags) {
+                    Ok(()) => {
+                        if let Some(entry) =
+                            self.entries.iter_mut().find(|entry| entry.gif.id == gif_id)
+                        {
+                            entry.tags = self.staged_tags.clone();
+                        }
+                        self.refresh_tag_stats();
+                        self.editing_tags_for = None;
+                        self.show_toast("Tags updated");
+                    }
+                    Err(err) => eprintln!("Failed to save tags for gif {gif_id}: {err}"),
+                }
+            }
+            Message::StartRenameTag(name) => {
+                self.renaming_tag = Some(name.clone());
+                self.tag_rename_draft = name;
+            }
+            Message::CancelRenameTag => {
+                self.renaming_tag = None;
+                self.tag_rename_draft.clear();
+            }
+            Message::TagRenameDraftChanged(value) => {
+                self.tag_rename_draft = value;
+            }
+            Message::ConfirmRenameTag => {
+                if let Some(old_name) = self.renaming_tag.take() {
+                    let new_name = self.tag_rename_draft.trim().to_string();
+
+                    if !new_name.is_empty() && new_name != old_name {
+                        match db::queries::rename_or_merge_tag(&self.conn, &old_name, &new_name) {
+                            Ok(()) => {
+                                for entry in self.entries.iter_mut().chain(&mut self.deleted_entries)
+                                {
+                                    for tag in entry.tags.iter_mut() {
+                                        if *tag == old_name {
+                                            *tag = new_name.clone();
+                                        }
+                                    }
+                                    entry.tags.sort();
+                                    entry.tags.dedup();
+                                }
+                                self.refresh_tag_stats();
+                                self.show_toast("Tag renamed");
+                            }
+                            Err(err) => eprintln!("Failed to rename tag {old_name}: {err}"),
+                        }
+                    }
+                }
+
+                self.tag_rename_draft.clear();
+            }
+            Message::FileDropped(path) => {
+                if path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("gif")).unwrap_or(false) {
+                    self.reset_modal_state();
+                    self.show_import_modal = true;
+                    let path_str = path.to_string_lossy().to_string();
+                    self.pending_thumbnail = thumbnail::load_animation(&path_str)
+                        .map(|animation| animation.frames[0].clone());
+                    self.pending_file = Some(path);
+                    self.import_error = None;
+                }
+            }
+            Message::ToggleSelectionMode => {
+                self.selection_mode = !self.selection_mode;
+                self.selected_ids.clear();
+                self.tag_draft.clear();
+                self.tag_suggestion = None;
+            }
+            Message::ToggleTileSelected(gif_id) => {
+                if !self.selected_ids.insert(gif_id) {
+                    self.selected_ids.remove(&gif_id);
+                }
+            }
+            Message::BulkTagDraftChanged(value) => {
+                self.tag_draft = value;
+                self.update_tag_suggestion();
+            }
+            Message::ApplyBulkTag => {
+                let tag = self.tag_draft.trim().to_string();
+                self.tag_draft.clear();
+                self.tag_suggestion = None;
+
+                if tag.is_empty() || self.selected_ids.is_empty() {
+                    return Task::none();
+                }
+
+                for &gif_id in &self.selected_ids {
+                    if let Some(entry) = self.entries.iter_mut().find(|entry| entry.gif.id == gif_id)
+                    {
+                        if !entry.tags.iter().any(|existing| existing.eq_ignore_ascii_case(&tag)) {
+                            entry.tags.push(tag.clone());
+                            entry.tags.sort();
+                        }
+                        let _ = db::queries::set_gif_tags_exact(&self.conn, gif_id, &entry.tags);
+                    }
+                }
+
+                self.refresh_tag_stats();
+                self.show_toast(format!("Tagged {} gifs", self.selected_ids.len()));
+            }
+            Message::BulkMoveToTrash => {
+                let ids: Vec<i64> = self.selected_ids.drain().collect();
+                let count = ids.len();
+
+                for gif_id in ids {
+                    if let Some(pos) = self.entries.iter().position(|entry| entry.gif.id == gif_id) {
+                        let mut entry = self.entries.remove(pos);
+                        if let Ok(gif) = db::queries::get_gif(&self.conn, gif_id) {
+                            entry.gif = gif;
+                        }
+                        let _ = db::queries::soft_delete_gif(&self.conn, gif_id);
+                        self.deleted_entries.insert(0, entry);
+                    }
+                }
+
+                self.selection_mode = false;
+                self.recompute_visible();
+                self.refresh_tag_stats();
+                self.show_toast(format!("Moved {count} gifs to trash"));
             }
             Message::SetViewMode(mode) => {
                 self.view_mode = mode;
@@ -1214,7 +1478,7 @@ impl App {
         Task::none()
     }
 
-    fn build_tile(entry: &GifEntry, height: f32) -> Element<Message> {
+    fn build_tile(entry: &GifEntry, height: f32, selection_mode: bool, is_selected: bool) -> Element<Message> {
         let gif_id = entry.gif.id;
 
         let image_element: Element<Message> = match &entry.animation {
@@ -1224,6 +1488,7 @@ impl App {
                     .width(Length::Fixed(TILE_WIDTH))
                     .height(Length::Fixed(height))
                     .content_fit(ContentFit::Cover)
+                    .border_radius(8.0)
                     .into()
             }
             // Not decoded (yet): hand the raw path to iced, which decodes
@@ -1235,33 +1500,100 @@ impl App {
                     .width(Length::Fixed(TILE_WIDTH))
                     .height(Length::Fixed(height))
                     .content_fit(ContentFit::Cover)
+                    .border_radius(8.0)
                     .into()
             }
         };
 
-        let clickable: Element<Message> =
-            mouse_area(image_element).on_press(Message::CopyGifFile(gif_id)).into();
+        let on_press = if selection_mode {
+            Message::ToggleTileSelected(gif_id)
+        } else {
+            Message::CopyGifFile(gif_id)
+        };
 
-        let menu_button = container(
-            button(text("⋮").size(18))
-                .on_press(Message::ShowDetail(gif_id))
-                .padding(4)
-                .style(button::secondary),
-        )
-        .align_right(Length::Fixed(TILE_WIDTH))
-        .align_top(Length::Fixed(height))
-        .padding(6);
+        // A `button` (rather than `mouse_area`) so hovering gets a visible
+        // highlight for free from iced's Hovered/Pressed status — an image
+        // has no such feedback on its own.
+        let clickable: Element<Message> = button(image_element)
+            .on_press(on_press)
+            .padding(0)
+            .style(move |theme, status| {
+                let accent = theme.extended_palette().primary.base.color;
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
 
-        let source_badge = container(
-            container(text(Self::source_icon(entry)).size(14))
-                .padding(4)
-                .style(container::rounded_box),
-        )
-        .align_left(Length::Fixed(TILE_WIDTH))
-        .align_bottom(Length::Fixed(height))
-        .padding(6);
+                button::Style {
+                    background: None,
+                    text_color: Color::TRANSPARENT,
+                    border: iced::Border {
+                        color: if is_selected || hovered { accent } else { Color::TRANSPARENT },
+                        width: if is_selected { 3.0 } else { 2.0 },
+                        radius: 8.0.into(),
+                    },
+                    shadow: iced::Shadow::default(),
+                    snap: false,
+                }
+            })
+            .into();
 
-        stack![clickable, menu_button, source_badge].into()
+        let mut layers = vec![clickable];
+
+        if selection_mode {
+            let mark = if is_selected { "✓" } else { "" };
+            layers.push(
+                container(
+                    container(text(mark).size(14))
+                        .width(Length::Fixed(22.0))
+                        .height(Length::Fixed(22.0))
+                        .align_x(Center)
+                        .align_y(Center)
+                        .style(move |theme: &Theme| {
+                            let accent = theme.extended_palette().primary.base.color;
+                            container::Style {
+                                background: Some(if is_selected {
+                                    accent.into()
+                                } else {
+                                    Color { a: 0.5, ..Color::BLACK }.into()
+                                }),
+                                border: iced::Border {
+                                    color: Color::WHITE,
+                                    width: 1.5,
+                                    radius: 11.0.into(),
+                                },
+                                text_color: Some(Color::WHITE),
+                                ..container::Style::default()
+                            }
+                        }),
+                )
+                .align_left(Length::Fixed(TILE_WIDTH))
+                .align_top(Length::Fixed(height))
+                .padding(6)
+                .into(),
+            );
+        } else {
+            let menu_button = container(
+                button(text("⋮").size(18))
+                    .on_press(Message::ShowDetail(gif_id))
+                    .padding(4)
+                    .style(button::secondary),
+            )
+            .align_right(Length::Fixed(TILE_WIDTH))
+            .align_top(Length::Fixed(height))
+            .padding(6);
+
+            let source_badge = container(
+                container(text(Self::source_icon(entry)).size(14))
+                    .padding(4)
+                    .style(container::rounded_box),
+            )
+            .align_left(Length::Fixed(TILE_WIDTH))
+            .align_bottom(Length::Fixed(height))
+            .padding(6);
+
+            layers.push(menu_button.into());
+            layers.push(source_badge.into());
+        }
+
+        stack(layers).into()
     }
 
     fn view(&self) -> Element<Message> {
@@ -1276,6 +1608,12 @@ impl App {
 
         let content: Element<Message> = if let Some(gif_id) = self.detail_gif_id {
             modal(base, self.detail_overlay_content(gif_id), Message::HideDetail)
+        } else if let Some(gif_id) = self.pending_permanent_delete {
+            modal(
+                base,
+                Self::permanent_delete_confirm_content(gif_id),
+                Message::CancelPermanentDelete,
+            )
         } else if let Some(path) = &self.pending_import_zip {
             modal(base, Self::import_confirm_content(path), Message::CancelImportBackup)
         } else if self.show_import_modal {
@@ -1298,9 +1636,11 @@ impl App {
                 .style(if active { button::primary } else { button::text })
         };
 
+        let app_theme = self.app_theme;
+
         container(
             column![
-                text("GifVault").size(20),
+                text("GifVault").size(22).font(Font::with_name("Fira Sans")),
                 column![
                     nav_button("Library", ViewMode::Library, self.view_mode == ViewMode::Library),
                     nav_button("Trash", ViewMode::Trash, self.view_mode == ViewMode::Trash),
@@ -1316,10 +1656,13 @@ impl App {
             ]
             .spacing(16)
             .padding(16)
-            .width(Length::Fixed(160.0))
+            .width(Length::Fixed(170.0))
             .height(Length::Fill),
         )
-        .style(container::rounded_box)
+        .style(move |_theme| container::Style {
+            background: Some(app_theme.recessed_background().into()),
+            ..container::Style::default()
+        })
         .into()
     }
 
@@ -1341,7 +1684,12 @@ impl App {
             for (position, &entry_index) in indices.iter().enumerate() {
                 let placement = &placements[position];
                 let entry = &self.entries[entry_index];
-                column_children[placement.column].push(Self::build_tile(entry, placement.height));
+                column_children[placement.column].push(Self::build_tile(
+                    entry,
+                    placement.height,
+                    self.selection_mode,
+                    self.selected_ids.contains(&entry.gif.id),
+                ));
             }
 
             row(column_children
@@ -1380,13 +1728,61 @@ impl App {
         }))
         .spacing(6);
 
-        column![
+        let header = row![
             text("Library").size(26),
+            container(column![]).width(Length::Fill),
+            button(if self.selection_mode { "Cancel" } else { "Select" })
+                .on_press(Message::ToggleSelectionMode)
+                .style(if self.selection_mode { button::danger } else { button::secondary }),
+        ]
+        .align_y(Center);
+
+        let selection_bar: Element<Message> = if self.selection_mode {
+            let suggestion_hint: Element<Message> = match &self.tag_suggestion {
+                Some(suggestion) => text(format!("Tab → {suggestion}")).size(12).into(),
+                None => column![].into(),
+            };
+
+            container(
+                column![
+                    row![
+                        text(format!("{} selected", self.selected_ids.len())).width(Length::Fill),
+                        button("Move to trash")
+                            .on_press(Message::BulkMoveToTrash)
+                            .style(button::danger),
+                    ]
+                    .spacing(10)
+                    .align_y(Center),
+                    row![
+                        text_input("Add a tag to all selected...", &self.tag_draft)
+                            .id(TAG_DRAFT_INPUT_ID)
+                            .on_input(Message::BulkTagDraftChanged)
+                            .on_submit(Message::ApplyBulkTag)
+                            .width(Length::Fill),
+                        button("Add tag").on_press(Message::ApplyBulkTag),
+                    ]
+                    .spacing(10)
+                    .align_y(Center),
+                    suggestion_hint,
+                ]
+                .spacing(8),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .style(container::rounded_box)
+            .into()
+        } else {
+            column![].into()
+        };
+
+        column![
+            header,
             text_input("Filter by tag...", &self.filter_input)
                 .on_input(Message::FilterChanged)
                 .width(Length::Fill),
             popular_tags_row,
             sort_row,
+            selection_bar,
             button("Add gif").on_press(Message::ShowImportModal),
             scrollable(grid)
                 .on_scroll(Message::Scrolled)
@@ -1449,7 +1845,7 @@ impl App {
                                 .width(Length::Fill),
                             button("Restore").on_press(Message::RestoreGif(entry.gif.id)),
                             button("Delete forever")
-                                .on_press(Message::PermanentlyDeleteGif(entry.gif.id))
+                                .on_press(Message::RequestPermanentDelete(entry.gif.id))
                                 .style(button::danger),
                         ]
                         .spacing(12)
@@ -1481,7 +1877,51 @@ impl App {
     }
 
     fn settings_view(&self) -> Element<Message> {
-        column![
+        let tag_rows: Vec<Element<Message>> = self
+            .tag_stats
+            .iter()
+            .map(|(name, count)| {
+                if self.renaming_tag.as_deref() == Some(name.as_str()) {
+                    row![
+                        text_input("New name...", &self.tag_rename_draft)
+                            .on_input(Message::TagRenameDraftChanged)
+                            .on_submit(Message::ConfirmRenameTag)
+                            .width(Length::Fill),
+                        button("Save").on_press(Message::ConfirmRenameTag),
+                        button("Cancel")
+                            .on_press(Message::CancelRenameTag)
+                            .style(button::text),
+                    ]
+                    .spacing(6)
+                    .align_y(Center)
+                    .into()
+                } else {
+                    row![
+                        text(format!("{name} ({count})")).width(Length::Fill),
+                        button("Rename")
+                            .on_press(Message::StartRenameTag(name.clone()))
+                            .style(button::text),
+                    ]
+                    .spacing(6)
+                    .align_y(Center)
+                    .into()
+                }
+            })
+            .collect();
+
+        let tags_section: Element<Message> = if self.tag_stats.is_empty() {
+            column![].into()
+        } else {
+            column![
+                text("Manage tags").size(14),
+                text("Rename a tag to an existing name to merge the two.").size(12),
+                column(tag_rows).spacing(8),
+            ]
+            .spacing(8)
+            .into()
+        };
+
+        let content = column![
             text("Settings").size(26),
             column![
                 text("Theme").size(14),
@@ -1519,12 +1959,13 @@ impl App {
                 text("Importing replaces your current library with the zip's contents.").size(12),
             ]
             .spacing(8),
+            tags_section,
         ]
         .spacing(24)
         .padding(20)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        .width(Length::Fill);
+
+        scrollable(content).height(Length::Fill).width(Length::Fill).into()
     }
 
     fn stats_view(&self) -> Element<Message> {
@@ -1576,6 +2017,27 @@ impl App {
         )
         .padding(20)
         .width(420)
+        .style(container::rounded_box)
+        .into()
+    }
+
+    fn permanent_delete_confirm_content(gif_id: i64) -> Element<'static, Message> {
+        container(
+            column![
+                text("Delete this gif forever?").size(18),
+                text("This removes the file from disk. It can't be undone.").size(13),
+                row![
+                    button("Cancel").on_press(Message::CancelPermanentDelete),
+                    button("Delete forever")
+                        .on_press(Message::PermanentlyDeleteGif(gif_id))
+                        .style(button::danger),
+                ]
+                .spacing(10),
+            ]
+            .spacing(12),
+        )
+        .padding(20)
+        .width(360)
         .style(container::rounded_box)
         .into()
     }
@@ -1683,16 +2145,49 @@ impl App {
             }
         };
 
-        let tags_line = if entry.tags.is_empty() {
-            "Tags: (none)".to_string()
+        let tags_section: Element<Message> = if self.editing_tags_for == Some(gif_id) {
+            let suggestion_hint: Element<Message> = match &self.tag_suggestion {
+                Some(suggestion) => text(format!("Tab → {suggestion}")).size(12).into(),
+                None => column![].into(),
+            };
+
+            column![
+                text("Tags").size(13),
+                Self::wrap_tag_pills(&self.staged_tags),
+                text_input("Type a tag, Enter or comma to add...", &self.tag_draft)
+                    .id(TAG_DRAFT_INPUT_ID)
+                    .on_input(Message::TagDraftChanged)
+                    .on_submit(Message::CommitTagDraft)
+                    .width(Length::Fill),
+                suggestion_hint,
+                row![
+                    button("Cancel").on_press(Message::CancelTagsEdit),
+                    button("Save tags").on_press(Message::SaveTagsEdit(gif_id)),
+                ]
+                .spacing(10),
+            ]
+            .spacing(6)
+            .into()
         } else {
-            format!("Tags: {}", entry.tags.join(", "))
+            let tags_line = if entry.tags.is_empty() {
+                "Tags: (none)".to_string()
+            } else {
+                format!("Tags: {}", entry.tags.join(", "))
+            };
+
+            row![
+                text(tags_line).width(Length::Fill),
+                button("Edit tags").on_press(Message::EditTagsClicked(gif_id)),
+            ]
+            .spacing(8)
+            .align_y(Center)
+            .into()
         };
 
         column![
             preview,
             text(format!("Added: {}", entry.gif.added_at)),
-            text(tags_line),
+            tags_section,
             row![
                 text(Self::source_icon(entry)).size(16),
                 button("Copy file").on_press(Message::CopyGifFile(gif_id)),
@@ -1850,6 +2345,7 @@ fn main() -> iced::Result {
         .title("GifVault")
         .subscription(App::subscription)
         .theme(App::theme)
+        .default_font(Font::with_name("Fira Sans"))
         .window(WindowSettings {
             size: Size::new(1000.0, 700.0),
             ..WindowSettings::default()

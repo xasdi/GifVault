@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.1.0
+
+**Look and feel**
+- Custom Discord-inspired dark/light theme (blurple accent, layered
+  backgrounds instead of one flat gray) instead of iced's stock Light/Dark
+- Fira Sans as the default font everywhere
+- Tiles now show a real hover highlight and rounded corners
+
+**Tags**
+- Edit an existing gif's tags from the detail view (was import-only before)
+- Rename or merge tags from Settings → Manage tags (renaming to an existing
+  tag's name merges the two, without creating duplicate tag/gif pairs)
+
+**Safety**
+- "Delete forever" in the trash now asks for confirmation first
+- Esc closes whichever modal/overlay is currently open
+
+**Bulk actions**
+- "Select" mode in the library: multi-select tiles, tag all of them at
+  once, or move them all to trash in one action
+
+**Import**
+- Drag a `.gif` file onto the window to open the import dialog with it
+  pre-selected, instead of only through the file picker
+
 ## v1.0.2
 
 - Fix: on Windows, launching `GifVault.exe` opened an extra console window
