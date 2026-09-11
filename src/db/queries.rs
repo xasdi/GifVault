@@ -86,6 +86,15 @@ pub fn rename_or_merge_tag(conn: &Connection, old_name: &str, new_name: &str) ->
     Ok(())
 }
 
+/// Deletes a tag entirely — every gif currently tagged with it loses that
+/// tag. The tag itself is gone afterward, not just unused.
+pub fn delete_tag(conn: &Connection, name: &str) -> Result<()> {
+    conn.execute("DELETE FROM gif_tags WHERE tag_id = (SELECT id FROM tags WHERE name = ?1)", [name])?;
+    conn.execute("DELETE FROM tags WHERE name = ?1", [name])?;
+
+    Ok(())
+}
+
 /// Irreversibly removes a gif's row (and its tag links). Only meant to be
 /// called from the trash view, on a gif that is already soft-deleted.
 pub fn permanently_delete_gif(conn: &Connection, gif_id: i64) -> Result<()> {

@@ -1,6 +1,6 @@
 [package]
 name = "GifVault"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 
 # Used by `cargo bundle` to produce a double-clickable macOS .app in CI.
@@ -24,7 +24,7 @@ iced = { version = "0.14", default-features = false, features = [
 rusqlite = { version = "0.32", features = ["bundled"] }
 directories = "5"
 rfd = "0.15"
-image = { version = "0.25", default-features = false, features = ["gif", "png"] }
+image = { version = "0.25", default-features = false, features = ["gif", "png", "jpeg", "webp"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "fs"] }

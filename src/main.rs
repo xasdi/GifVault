@@ -28,6 +28,12 @@ use std::time::{Duration, Instant};
 use thumbnail::GifAnimation;
 
 const TAG_DRAFT_INPUT_ID: &str = "tag-draft-input";
+const SEARCH_DRAFT_INPUT_ID: &str = "search-draft-input";
+
+/// Funny pictures aren't always animated — these all decode fine (see the
+/// codec features enabled on the `image` crate in Cargo.toml), they just
+/// don't play, same as a single-frame gif wouldn't.
+const SUPPORTED_IMAGE_EXTENSIONS: [&str; 5] = ["gif", "png", "jpg", "jpeg", "webp"];
 
 const GRID_COLUMNS: usize = 3;
 const TILE_WIDTH: f32 = 280.0;
@@ -76,6 +82,26 @@ impl SortMode {
             SortMode::DateOldest => "Oldest",
             SortMode::MostUsed => "Most used",
             SortMode::LeastUsed => "Least used",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TagSortMode {
+    Name,
+    MostUsed,
+    LeastUsed,
+}
+
+impl TagSortMode {
+    const ALL: [TagSortMode; 3] =
+        [TagSortMode::Name, TagSortMode::MostUsed, TagSortMode::LeastUsed];
+
+    fn label(self) -> &'static str {
+        match self {
+            TagSortMode::Name => "Name",
+            TagSortMode::MostUsed => "Most used",
+            TagSortMode::LeastUsed => "Least used",
         }
     }
 }
@@ -180,7 +206,12 @@ struct App {
     view_mode: ViewMode,
     sort_mode: SortMode,
     app_theme: AppTheme,
-    filter_input: String,
+    /// Committed search criteria (a gif must have every one of these tags,
+    /// exactly — AND semantics) plus whatever's still being typed (matched
+    /// as a live substring against any tag, for as-you-type feedback).
+    search_tags: Vec<String>,
+    search_draft: String,
+    search_suggestion: Option<String>,
     show_import_modal: bool,
     pending_file: Option<PathBuf>,
     staged_gif: Option<StagedGif>,
@@ -211,11 +242,18 @@ struct App {
     tag_rename_draft: String,
     selection_mode: bool,
     selected_ids: HashSet<i64>,
+    tags_section_expanded: bool,
+    tag_search_input: String,
+    tag_sort_mode: TagSortMode,
+    pending_tag_delete: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    FilterChanged(String),
+    SearchDraftChanged(String),
+    CommitSearchDraft,
+    RemoveSearchTag(usize),
+    SearchInputKey(keyboard::Event),
     ShowImportModal,
     HideImportModal,
     PickFile,
@@ -253,6 +291,12 @@ enum Message {
     BulkTagDraftChanged(String),
     ApplyBulkTag,
     BulkMoveToTrash,
+    ToggleTagsSectionExpanded,
+    TagSearchInputChanged(String),
+    TagSortModeChanged(TagSortMode),
+    RequestDeleteTag(String),
+    CancelDeleteTag,
+    ConfirmDeleteTag(String),
     Scrolled(scrollable::Viewport),
     Tick(Instant),
     SetViewMode(ViewMode),
@@ -317,7 +361,9 @@ impl App {
             view_mode: ViewMode::Library,
             sort_mode: SortMode::DateNewest,
             app_theme,
-            filter_input: String::new(),
+            search_tags: Vec::new(),
+            search_draft: String::new(),
+            search_suggestion: None,
             show_import_modal: false,
             pending_file: None,
             staged_gif: None,
@@ -346,6 +392,10 @@ impl App {
             tag_rename_draft: String::new(),
             selection_mode: false,
             selected_ids: HashSet::new(),
+            tags_section_expanded: false,
+            tag_search_input: String::new(),
+            tag_sort_mode: TagSortMode::Name,
+            pending_tag_delete: None,
         };
         Self::backfill_dimensions_for(&app.conn, &mut app.entries);
         Self::backfill_dimensions_for(&app.conn, &mut app.deleted_entries);
@@ -479,19 +529,32 @@ impl App {
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
-        let filter = self.filter_input.trim().to_lowercase();
+        let draft = self.search_draft.trim().to_lowercase();
 
-        let mut indices: Vec<usize> = if filter.is_empty() {
+        let mut indices: Vec<usize> = if self.search_tags.is_empty() && draft.is_empty() {
             (0..self.entries.len()).collect()
         } else {
             self.entries
                 .iter()
                 .enumerate()
                 .filter(|(_, entry)| {
-                    entry
-                        .tags
-                        .iter()
-                        .any(|tag| tag.to_lowercase().contains(&filter))
+                    let tags_lower: Vec<String> =
+                        entry.tags.iter().map(|tag| tag.to_lowercase()).collect();
+
+                    // Every committed tag must match exactly (AND, not "any
+                    // of them") — "sad" + "cat" means both, not either.
+                    let matches_committed = self.search_tags.iter().all(|needed| {
+                        let needed = needed.to_lowercase();
+                        tags_lower.iter().any(|tag| *tag == needed)
+                    });
+
+                    // Whatever's still being typed narrows further, as a
+                    // live substring match, same as the old single-box
+                    // search did.
+                    let matches_draft =
+                        draft.is_empty() || tags_lower.iter().any(|tag| tag.contains(&draft));
+
+                    matches_committed && matches_draft
                 })
                 .map(|(index, _)| index)
                 .collect()
@@ -641,6 +704,48 @@ impl App {
         self.tag_suggestion = None;
     }
 
+    fn update_search_suggestion(&mut self) {
+        let draft = self.search_draft.trim().to_lowercase();
+
+        if draft.is_empty() {
+            self.search_suggestion = None;
+            return;
+        }
+
+        let mut candidates: Vec<&(String, i64)> = self
+            .tag_stats
+            .iter()
+            .filter(|(name, _)| {
+                name.to_lowercase().starts_with(&draft)
+                    && !self.search_tags.iter().any(|staged| staged.eq_ignore_ascii_case(name))
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        self.search_suggestion = candidates.first().map(|(name, _)| name.clone());
+    }
+
+    fn push_search_tag(&mut self, tag: &str) {
+        let tag = tag.trim();
+
+        if tag.is_empty() {
+            return;
+        }
+
+        if self.search_tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
+            return;
+        }
+
+        self.search_tags.push(tag.to_string());
+    }
+
+    fn commit_search_draft(&mut self) {
+        let tag = std::mem::take(&mut self.search_draft);
+        self.push_search_tag(&tag);
+        self.search_suggestion = None;
+    }
+
     fn show_toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), Instant::now()));
     }
@@ -669,8 +774,22 @@ impl App {
 
         let newly_visible: Vec<i64> =
             new_visible.iter().filter(|id| !self.visible_gif_ids.contains(id)).copied().collect();
+        let no_longer_visible: Vec<i64> =
+            self.visible_gif_ids.iter().filter(|id| !new_visible.contains(id)).copied().collect();
 
         self.visible_gif_ids = new_visible;
+
+        // Frees the decoded frames of whatever just scrolled off screen —
+        // otherwise memory only ever grows as you scroll through a large
+        // library. Cheap to undo: they're still on the disk cache, so
+        // scrolling back just means a fast cache read, not a re-decode.
+        for id in no_longer_visible {
+            if let Some(entry) = self.entries.iter_mut().find(|entry| entry.gif.id == id) {
+                entry.animation = None;
+                entry.current_frame = 0;
+                entry.frame_elapsed_ms = 0;
+            }
+        }
 
         if !newly_visible.is_empty() {
             self.ensure_decoded(&newly_visible);
@@ -706,12 +825,37 @@ impl App {
             return Err(format!("Server returned status {}", response.status()));
         }
 
+        // Not every funny picture is a gif — figure out the real format
+        // from the response (falling back to the URL, then to "gif") so a
+        // downloaded PNG/JPEG/WebP doesn't get mislabeled.
+        let extension = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                match content_type.split(';').next().unwrap_or("").trim() {
+                    "image/gif" => Some("gif"),
+                    "image/png" => Some("png"),
+                    "image/jpeg" => Some("jpg"),
+                    "image/webp" => Some("webp"),
+                    _ => None,
+                }
+            })
+            .or_else(|| {
+                let path_lower = url.split(['?', '#']).next().unwrap_or(&url).to_lowercase();
+                SUPPORTED_IMAGE_EXTENSIONS
+                    .into_iter()
+                    .find(|ext| path_lower.ends_with(&format!(".{ext}")))
+            })
+            .unwrap_or("gif");
+
         let bytes = response
             .bytes()
             .await
             .map_err(|e| format!("Failed to read response body: {e}"))?;
 
-        let destination = db::gifs_storage_dir().join(format!("{}.gif", uuid::Uuid::new_v4()));
+        let destination =
+            db::gifs_storage_dir().join(format!("{}.{extension}", uuid::Uuid::new_v4()));
 
         std::fs::write(&destination, &bytes)
             .map_err(|e| format!("Failed to save downloaded file: {e}"))?;
@@ -888,6 +1032,10 @@ impl App {
             subs.push(keyboard::listen().map(Message::TagInputKey));
         }
 
+        if self.view_mode == ViewMode::Library && self.search_suggestion.is_some() {
+            subs.push(keyboard::listen().map(Message::SearchInputKey));
+        }
+
         if self.any_modal_open() {
             subs.push(keyboard::listen().map(Message::ModalKeyPressed));
         }
@@ -907,6 +1055,7 @@ impl App {
             || self.pending_import_zip.is_some()
             || self.show_import_modal
             || self.pending_permanent_delete.is_some()
+            || self.pending_tag_delete.is_some()
     }
 
     /// Closes whichever overlay is currently on top, matching the priority
@@ -927,9 +1076,45 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::FilterChanged(value) => {
-                self.filter_input = value;
+            Message::SearchDraftChanged(value) => {
+                if value.contains(' ') {
+                    let parts: Vec<&str> = value.split(' ').collect();
+                    let last = parts.len() - 1;
+
+                    for part in &parts[..last] {
+                        self.push_search_tag(part);
+                    }
+
+                    self.search_draft = parts[last].to_string();
+                } else {
+                    self.search_draft = value;
+                }
+
+                self.update_search_suggestion();
                 self.recompute_visible();
+            }
+            Message::CommitSearchDraft => {
+                self.commit_search_draft();
+                self.recompute_visible();
+            }
+            Message::RemoveSearchTag(index) => {
+                if index < self.search_tags.len() {
+                    self.search_tags.remove(index);
+                    self.recompute_visible();
+                }
+            }
+            Message::SearchInputKey(event) => {
+                if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    ..
+                } = event
+                {
+                    if let Some(suggestion) = self.search_suggestion.clone() {
+                        self.search_draft = suggestion;
+                        self.update_search_suggestion();
+                        return iced::widget::operation::move_cursor_to_end(SEARCH_DRAFT_INPUT_ID);
+                    }
+                }
             }
             Message::ShowImportModal => {
                 self.reset_modal_state();
@@ -942,7 +1127,7 @@ impl App {
                 return Task::perform(
                     async {
                         rfd::AsyncFileDialog::new()
-                            .add_filter("GIF", &["gif"])
+                            .add_filter("Image", &SUPPORTED_IMAGE_EXTENSIONS)
                             .pick_file()
                             .await
                             .map(|handle| handle.path().to_path_buf())
@@ -1041,7 +1226,7 @@ impl App {
                 }
             }
             Message::PopularTagClicked(tag_name) => {
-                self.filter_input = tag_name;
+                self.push_search_tag(&tag_name);
                 self.recompute_visible();
             }
             Message::ImportModeChanged(mode) => {
@@ -1298,8 +1483,45 @@ impl App {
 
                 self.tag_rename_draft.clear();
             }
+            Message::ToggleTagsSectionExpanded => {
+                self.tags_section_expanded = !self.tags_section_expanded;
+            }
+            Message::TagSearchInputChanged(value) => {
+                self.tag_search_input = value;
+            }
+            Message::TagSortModeChanged(mode) => {
+                self.tag_sort_mode = mode;
+            }
+            Message::RequestDeleteTag(name) => {
+                self.pending_tag_delete = Some(name);
+            }
+            Message::CancelDeleteTag => {
+                self.pending_tag_delete = None;
+            }
+            Message::ConfirmDeleteTag(name) => {
+                self.pending_tag_delete = None;
+
+                match db::queries::delete_tag(&self.conn, &name) {
+                    Ok(()) => {
+                        for entry in self.entries.iter_mut().chain(&mut self.deleted_entries) {
+                            entry.tags.retain(|tag| *tag != name);
+                        }
+                        self.refresh_tag_stats();
+                        self.show_toast("Tag deleted");
+                    }
+                    Err(err) => eprintln!("Failed to delete tag {name}: {err}"),
+                }
+            }
             Message::FileDropped(path) => {
-                if path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("gif")).unwrap_or(false) {
+                let is_supported_image = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| {
+                        SUPPORTED_IMAGE_EXTENSIONS.iter().any(|supported| ext.eq_ignore_ascii_case(supported))
+                    })
+                    .unwrap_or(false);
+
+                if is_supported_image {
                     self.reset_modal_state();
                     self.show_import_modal = true;
                     let path_str = path.to_string_lossy().to_string();
@@ -1614,6 +1836,8 @@ impl App {
                 Self::permanent_delete_confirm_content(gif_id),
                 Message::CancelPermanentDelete,
             )
+        } else if let Some(name) = &self.pending_tag_delete {
+            modal(base, Self::delete_tag_confirm_content(name), Message::CancelDeleteTag)
         } else if let Some(path) = &self.pending_import_zip {
             modal(base, Self::import_confirm_content(path), Message::CancelImportBackup)
         } else if self.show_import_modal {
@@ -1775,11 +1999,25 @@ impl App {
             column![].into()
         };
 
+        let search_suggestion_hint: Element<Message> = match &self.search_suggestion {
+            Some(suggestion) => text(format!("Tab → {suggestion}")).size(12).into(),
+            None => column![].into(),
+        };
+
+        let search_section = column![
+            Self::wrap_tag_pills(&self.search_tags, Message::RemoveSearchTag),
+            text_input("Search by tag... (space to add another)", &self.search_draft)
+                .id(SEARCH_DRAFT_INPUT_ID)
+                .on_input(Message::SearchDraftChanged)
+                .on_submit(Message::CommitSearchDraft)
+                .width(Length::Fill),
+            search_suggestion_hint,
+        ]
+        .spacing(6);
+
         column![
             header,
-            text_input("Filter by tag...", &self.filter_input)
-                .on_input(Message::FilterChanged)
-                .width(Length::Fill),
+            search_section,
             popular_tags_row,
             sort_row,
             selection_bar,
@@ -1876,10 +2114,47 @@ impl App {
         .into()
     }
 
-    fn settings_view(&self) -> Element<Message> {
-        let tag_rows: Vec<Element<Message>> = self
+    fn manage_tags_section(&self) -> Element<Message> {
+        let toggle_label = if self.tags_section_expanded {
+            "▾ Manage tags"
+        } else {
+            "▸ Manage tags"
+        };
+
+        let header = row![
+            button(text(toggle_label).size(14))
+                .on_press(Message::ToggleTagsSectionExpanded)
+                .style(button::text)
+                .padding(0),
+            container(column![]).width(Length::Fill),
+            text(format!("{} total", self.tag_stats.len())).size(12),
+        ]
+        .align_y(Center);
+
+        if !self.tags_section_expanded {
+            return header.into();
+        }
+
+        let search = self.tag_search_input.trim().to_lowercase();
+
+        let mut visible_tags: Vec<&(String, i64)> = self
             .tag_stats
             .iter()
+            .filter(|(name, _)| search.is_empty() || name.to_lowercase().contains(&search))
+            .collect();
+
+        match self.tag_sort_mode {
+            TagSortMode::Name => visible_tags.sort_by(|a, b| a.0.cmp(&b.0)),
+            TagSortMode::MostUsed => {
+                visible_tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
+            TagSortMode::LeastUsed => {
+                visible_tags.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            }
+        }
+
+        let tag_rows: Vec<Element<Message>> = visible_tags
+            .into_iter()
             .map(|(name, count)| {
                 if self.renaming_tag.as_deref() == Some(name.as_str()) {
                     row![
@@ -1901,6 +2176,9 @@ impl App {
                         button("Rename")
                             .on_press(Message::StartRenameTag(name.clone()))
                             .style(button::text),
+                        button("Delete")
+                            .on_press(Message::RequestDeleteTag(name.clone()))
+                            .style(button::danger),
                     ]
                     .spacing(6)
                     .align_y(Center)
@@ -1909,17 +2187,40 @@ impl App {
             })
             .collect();
 
-        let tags_section: Element<Message> = if self.tag_stats.is_empty() {
-            column![].into()
+        let sort_row = row(TagSortMode::ALL.iter().map(|&mode| {
+            button(text(mode.label()).size(12))
+                .on_press(Message::TagSortModeChanged(mode))
+                .style(if self.tag_sort_mode == mode { button::primary } else { button::secondary })
+                .padding(6)
+                .into()
+        }))
+        .spacing(6);
+
+        let list: Element<Message> = if tag_rows.is_empty() {
+            text("No tags match").size(12).into()
         } else {
-            column![
-                text("Manage tags").size(14),
-                text("Rename a tag to an existing name to merge the two.").size(12),
-                column(tag_rows).spacing(8),
-            ]
-            .spacing(8)
-            .into()
+            // Bounded height with its own scrollbar, so a big tag list
+            // doesn't push the rest of Settings off screen.
+            scrollable(column(tag_rows).spacing(8))
+                .height(Length::Fixed(240.0))
+                .into()
         };
+
+        column![
+            header,
+            text("Rename a tag to an existing name to merge the two.").size(12),
+            text_input("Search tags...", &self.tag_search_input)
+                .on_input(Message::TagSearchInputChanged)
+                .width(Length::Fill),
+            sort_row,
+            list,
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    fn settings_view(&self) -> Element<Message> {
+        let tags_section = self.manage_tags_section();
 
         let content = column![
             text("Settings").size(26),
@@ -2042,6 +2343,27 @@ impl App {
         .into()
     }
 
+    fn delete_tag_confirm_content(name: &str) -> Element<'static, Message> {
+        container(
+            column![
+                text(format!("Delete tag \"{name}\"?")).size(18),
+                text("This removes it from every gif that has it. It can't be undone.").size(13),
+                row![
+                    button("Cancel").on_press(Message::CancelDeleteTag),
+                    button("Delete tag")
+                        .on_press(Message::ConfirmDeleteTag(name.to_string()))
+                        .style(button::danger),
+                ]
+                .spacing(10),
+            ]
+            .spacing(12),
+        )
+        .padding(20)
+        .width(360)
+        .style(container::rounded_box)
+        .into()
+    }
+
     /// Shows just the start of a (possibly very long) source link plus a
     /// link icon, with the full value available on hover — the add-gif
     /// screen doesn't need to be cluttered with a whole URL or file path.
@@ -2081,7 +2403,10 @@ impl App {
 
     /// Lays tag pills out left-to-right, wrapping to a new line once a row
     /// would overflow the modal's width (iced has no built-in wrap layout).
-    fn wrap_tag_pills(staged_tags: &[String]) -> Element<'_, Message> {
+    fn wrap_tag_pills(
+        tags: &[String],
+        on_remove: impl Fn(usize) -> Message + Copy + 'static,
+    ) -> Element<'static, Message> {
         const MAX_ROW_WIDTH: f32 = 400.0;
         const CHAR_WIDTH: f32 = 7.0;
         const CHIP_OVERHEAD: f32 = 46.0;
@@ -2089,7 +2414,7 @@ impl App {
         let mut lines: Vec<Vec<Element<Message>>> = vec![Vec::new()];
         let mut current_width = 0.0;
 
-        for (index, tag) in staged_tags.iter().enumerate() {
+        for (index, tag) in tags.iter().enumerate() {
             let chip_width = tag.chars().count() as f32 * CHAR_WIDTH + CHIP_OVERHEAD;
 
             if current_width + chip_width > MAX_ROW_WIDTH && !lines.last().unwrap().is_empty() {
@@ -2098,7 +2423,7 @@ impl App {
             }
 
             current_width += chip_width + 6.0;
-            lines.last_mut().unwrap().push(Self::tag_pill(index, tag));
+            lines.last_mut().unwrap().push(Self::tag_pill(index, tag, on_remove));
         }
 
         column(lines.into_iter().map(|line| row(line).spacing(6).into()))
@@ -2106,12 +2431,16 @@ impl App {
             .into()
     }
 
-    fn tag_pill(index: usize, tag: &str) -> Element<'static, Message> {
+    fn tag_pill(
+        index: usize,
+        tag: &str,
+        on_remove: impl Fn(usize) -> Message,
+    ) -> Element<'static, Message> {
         container(
             row![
                 text(tag.to_string()).size(13),
                 button(text("×").size(13))
-                    .on_press(Message::RemoveStagedTag(index))
+                    .on_press(on_remove(index))
                     .padding(2)
                     .style(button::text),
             ]
@@ -2153,7 +2482,7 @@ impl App {
 
             column![
                 text("Tags").size(13),
-                Self::wrap_tag_pills(&self.staged_tags),
+                Self::wrap_tag_pills(&self.staged_tags, Message::RemoveStagedTag),
                 text_input("Type a tag, Enter or comma to add...", &self.tag_draft)
                     .id(TAG_DRAFT_INPUT_ID)
                     .on_input(Message::TagDraftChanged)
@@ -2184,25 +2513,34 @@ impl App {
             .into()
         };
 
-        column![
-            preview,
-            text(format!("Added: {}", entry.gif.added_at)),
-            tags_section,
-            row![
-                text(Self::source_icon(entry)).size(16),
-                button("Copy file").on_press(Message::CopyGifFile(gif_id)),
+        container(
+            column![
+                preview,
+                text(format!("Added: {}", entry.gif.added_at)),
+                tags_section,
+                row![
+                    text(Self::source_icon(entry)).size(16),
+                    button("Copy file").on_press(Message::CopyGifFile(gif_id)),
+                ]
+                .spacing(8)
+                .align_y(Center),
+                row![
+                    button("Move to trash")
+                        .on_press(Message::MoveToTrash(gif_id))
+                        .style(button::danger),
+                    button("Close").on_press(Message::HideDetail),
+                ]
+                .spacing(10),
             ]
-            .spacing(8)
-            .align_y(Center),
-            row![
-                button("Move to trash")
-                    .on_press(Message::MoveToTrash(gif_id))
-                    .style(button::danger),
-                button("Close").on_press(Message::HideDetail),
-            ]
-            .spacing(10),
-        ]
-        .spacing(12)
+            .spacing(12),
+        )
+        // A fixed width, same idea as the import modal: without it, a row
+        // containing a `Length::Fill` element (like the tags row) has no
+        // bound to fill *within*, and ends up stretching the whole overlay
+        // — which is exactly what pushed the "Edit tags" button off-screen.
+        .padding(20)
+        .width(440)
+        .style(container::rounded_box)
         .into()
     }
 
@@ -2257,7 +2595,7 @@ impl App {
             };
 
             let tags_section = column![
-                Self::wrap_tag_pills(&self.staged_tags),
+                Self::wrap_tag_pills(&self.staged_tags, Message::RemoveStagedTag),
                 text_input("Type a tag, Enter or comma to add...", &self.tag_draft)
                     .id(TAG_DRAFT_INPUT_ID)
                     .on_input(Message::TagDraftChanged)
@@ -2296,8 +2634,9 @@ impl App {
             column![
                 text("No file selected"),
                 button("Choose file").on_press(Message::PickFile),
+                text("...or drag one onto the window").size(12),
                 text("— or —"),
-                text_input("Paste a GIF URL...", &self.url_input)
+                text_input("Paste an image/GIF URL...", &self.url_input)
                     .on_input(Message::UrlInputChanged)
                     .width(Length::Fill),
                 fetch_button,

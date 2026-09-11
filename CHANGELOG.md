@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.2.0
+
+**Memory**
+- Fixed a real memory leak: decoded gif frames were never freed after a
+  tile scrolled off screen, so RAM only ever grew. Scrolling out now frees
+  them again — scrolling back is a fast disk-cache read, not a re-decode
+
+**Fixes**
+- The "Edit tags" button in the detail view could get pushed off-screen;
+  the detail overlay now has a fixed width like the other modals
+
+**Search**
+- The library search box is now tag pills, not free text: type a tag,
+  press space (or Tab to accept a suggested match) to add it as a
+  criterion, add more the same way — results need *all* of them, not just
+  one. Typing without pressing space still live-filters as before
+- Popular-tag chips add to the search criteria instead of replacing them
+
+**Manage tags**
+- Collapsed by default
+- Search box to find a tag in a long list
+- Sort by name / most used / least used
+- Delete a tag outright (removes it from every gif that has it, with a
+  confirmation first)
+- The list itself is height-capped with its own scrollbar once expanded
+
+**Images**
+- Funny pictures aren't always animated — PNG, JPEG and WebP are now
+  supported everywhere a gif was (file picker, drag & drop, URL import,
+  with the URL path correctly detecting the real format instead of always
+  assuming .gif)
+
 ## v1.1.0
 
 **Look and feel**
